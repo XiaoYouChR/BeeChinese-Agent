@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import asyncio
 import os
 import re
 import threading
@@ -10,8 +11,9 @@ import urllib.parse
 import warnings
 import xml.etree.ElementTree as ET
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
 warnings.simplefilter("ignore", DeprecationWarning)
@@ -35,6 +37,8 @@ if TYPE_CHECKING:
 
 
 USER_AGENT = "BeeChineseDocsTool/0.1 (+https://docs.openhands.dev)"
+MAX_PARALLEL_FETCHES = 6
+MAX_SITEMAP_WORKERS = 6
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +52,10 @@ class DocsSource:
     sitemap_candidates: tuple[str, ...]
     github_tree_api_url: str | None = None
     github_content_prefix: str | None = None
+    github_repository: str | None = None
+    github_ref: str | None = None
+    preferred_url_fragments: tuple[str, ...] = ()
+    discouraged_url_fragments: tuple[str, ...] = ()
 
 
 DOCS_SOURCES: tuple[DocsSource, ...] = (
@@ -57,6 +65,7 @@ DOCS_SOURCES: tuple[DocsSource, ...] = (
         home_url="https://docs.openhands.dev/sdk/",
         domains=("docs.openhands.dev",),
         sitemap_candidates=("https://docs.openhands.dev/sitemap.xml",),
+        preferred_url_fragments=("/sdk/", "/api-reference/"),
     ),
     DocsSource(
         key="taro",
@@ -64,6 +73,7 @@ DOCS_SOURCES: tuple[DocsSource, ...] = (
         home_url="https://docs.taro.zone/",
         domains=("docs.taro.zone",),
         sitemap_candidates=("https://docs.taro.zone/sitemap.xml",),
+        preferred_url_fragments=("/docs/",),
     ),
     DocsSource(
         key="nextjs",
@@ -71,6 +81,7 @@ DOCS_SOURCES: tuple[DocsSource, ...] = (
         home_url="https://nextjs.org/docs",
         domains=("nextjs.org",),
         sitemap_candidates=("https://nextjs.org/sitemap.xml",),
+        preferred_url_fragments=("/docs/",),
     ),
     DocsSource(
         key="nestjs",
@@ -87,6 +98,16 @@ DOCS_SOURCES: tuple[DocsSource, ...] = (
             "?recursive=1"
         ),
         github_content_prefix="content/",
+        github_repository="nestjs/docs.nestjs.com",
+        github_ref="master",
+        preferred_url_fragments=(
+            "/techniques/",
+            "/fundamentals/",
+            "/controllers",
+            "/providers",
+            "/modules",
+            "/pipes",
+        ),
     ),
     DocsSource(
         key="fastapi",
@@ -94,13 +115,23 @@ DOCS_SOURCES: tuple[DocsSource, ...] = (
         home_url="https://fastapi.tiangolo.com/",
         domains=("fastapi.tiangolo.com",),
         sitemap_candidates=("https://fastapi.tiangolo.com/sitemap.xml",),
+        preferred_url_fragments=("/tutorial/", "/advanced/", "/reference/"),
     ),
     DocsSource(
         key="react",
         label="React Docs",
         home_url="https://react.dev/",
         domains=("react.dev",),
-        sitemap_candidates=("https://react.dev/sitemap.xml",),
+        sitemap_candidates=("https://react.dev/robots.txt",),
+        github_tree_api_url=(
+            "https://api.github.com/repos/reactjs/react.dev/git/trees/main"
+            "?recursive=1"
+        ),
+        github_content_prefix="src/content/",
+        github_repository="reactjs/react.dev",
+        github_ref="main",
+        preferred_url_fragments=("/reference/", "/learn/"),
+        discouraged_url_fragments=("/blog/",),
     ),
     DocsSource(
         key="typescript",
@@ -108,6 +139,7 @@ DOCS_SOURCES: tuple[DocsSource, ...] = (
         home_url="https://www.typescriptlang.org/docs/",
         domains=("www.typescriptlang.org", "typescriptlang.org"),
         sitemap_candidates=("https://www.typescriptlang.org/sitemap.xml",),
+        preferred_url_fragments=("/docs/",),
     ),
     DocsSource(
         key="postgresql",
@@ -115,6 +147,7 @@ DOCS_SOURCES: tuple[DocsSource, ...] = (
         home_url="https://www.postgresql.org/docs/",
         domains=("www.postgresql.org", "postgresql.org"),
         sitemap_candidates=("https://www.postgresql.org/sitemap.xml",),
+        preferred_url_fragments=("/docs/",),
     ),
     DocsSource(
         key="redis",
@@ -122,17 +155,76 @@ DOCS_SOURCES: tuple[DocsSource, ...] = (
         home_url="https://redis.io/docs/latest/",
         domains=("redis.io",),
         sitemap_candidates=("https://redis.io/sitemap.xml",),
+        preferred_url_fragments=("/docs/", "/commands/", "/develop/"),
+        discouraged_url_fragments=(
+            "/blog/",
+            "/glossary/",
+            "/resources/",
+            "/company/",
+            "/solutions/",
+            "/compare/",
+            "/pricing/",
+            "/events/",
+        ),
     ),
     DocsSource(
         key="minio",
         label="MinIO Docs",
-        home_url="https://min.io/docs/minio/",
-        domains=("min.io",),
-        sitemap_candidates=("https://min.io/sitemap.xml",),
+        home_url="https://docs.min.io/community/minio-object-store/",
+        domains=("docs.min.io",),
+        sitemap_candidates=("https://docs.min.io/robots.txt",),
+        preferred_url_fragments=(
+            "/community/minio-object-store/",
+            "/community/minio-kes/",
+            "/community/minio-directpv/",
+            "/enterprise/aistor-object-store/",
+        ),
     ),
 )
 
 DOCS_SOURCE_BY_KEY = {source.key: source for source in DOCS_SOURCES}
+
+BAD_ASSET_EXTENSIONS = (
+    ".css",
+    ".js",
+    ".mjs",
+    ".map",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".webp",
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".mp4",
+    ".mp3",
+    ".webm",
+    ".txt",
+    ".xml",
+    ".json",
+    ".webmanifest",
+    ".rss",
+)
+
+NOISY_PREFIXES = (
+    "skip to main content",
+    "openhands docs home page",
+    "search...",
+    "navigation",
+)
+
+NOISY_INLINE_PHRASES = (
+    "copy page",
+    "ask ai",
+)
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -162,10 +254,6 @@ def _token_groups(text: str) -> list[list[str]]:
     return groups
 
 
-def _tokenize(text: str) -> list[str]:
-    return _dedupe([token for group in _token_groups(text) for token in group])
-
-
 def _token_variants(token: str) -> list[str]:
     variants = [token]
     if len(token) >= 4:
@@ -191,6 +279,23 @@ def _strip_tags(html_text: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(cleaned)).strip()
 
 
+def _extract_primary_html(html_text: str) -> str:
+    patterns = (
+        r"(?is)<main\b[^>]*>(.*?)</main>",
+        r"(?is)<article\b[^>]*>(.*?)</article>",
+        r'(?is)<div\b[^>]*role=["\']main["\'][^>]*>(.*?)</div>',
+    )
+    best_match = ""
+    for pattern in patterns:
+        matches = re.findall(pattern, html_text)
+        if not matches:
+            continue
+        candidate = max(matches, key=len)
+        if len(candidate) > len(best_match):
+            best_match = candidate
+    return best_match or html_text
+
+
 def _extract_title(html_text: str) -> str:
     match = re.search(r"(?is)<title>(.*?)</title>", html_text)
     if not match:
@@ -213,11 +318,73 @@ def _extract_meta_description(html_text: str) -> str:
 def _extract_headings(html_text: str) -> list[str]:
     headings = re.findall(r"(?is)<h[1-3][^>]*>(.*?)</h[1-3]>", html_text)
     cleaned = [
-        re.sub(r"\s+", " ", _strip_tags(heading)).strip()
+        re.sub(r"\s+", " ", _strip_tags(heading))
+        .replace("\u200b", "")
+        .replace("¶", "")
+        .strip()
         for heading in headings
         if _strip_tags(heading).strip()
     ]
     return cleaned[:8]
+
+
+def _extract_markdown_headings(markdown_text: str) -> list[str]:
+    headings = []
+    for line in markdown_text.splitlines():
+        match = re.match(r"^\s{0,3}#{1,3}\s+(.*)$", line)
+        if not match:
+            continue
+        heading = re.sub(r"\s+", " ", match.group(1)).strip()
+        heading = re.sub(r"\{#.*?\}$", "", heading).strip()
+        heading = re.sub(r"\{\/\*.*?\*\/\}", "", heading).strip()
+        heading = heading.replace("`", "").strip()
+        if heading:
+            headings.append(heading)
+    return _dedupe(headings)[:8]
+
+
+def _extract_frontmatter_title(markdown_text: str) -> str:
+    match = re.match(r"(?ms)^---\s*\n(.*?)\n---\s*\n", markdown_text)
+    if not match:
+        return ""
+    frontmatter = match.group(1)
+    title_match = re.search(r'(?im)^title:\s*["\']?(.*?)["\']?\s*$', frontmatter)
+    if not title_match:
+        return ""
+    return re.sub(r"\s+", " ", title_match.group(1)).strip()
+
+
+def _strip_markdown(markdown_text: str) -> str:
+    text = markdown_text
+    text = re.sub(r"(?ms)^---\s*\n.*?\n---\s*\n", "", text)
+    text = re.sub(r"(?ms)^```.*?^```", " ", text)
+    text = re.sub(r"\{\/\*.*?\*\/\}", " ", text)
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+\.\s+", "", text, flags=re.MULTILINE)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _clean_excerpt(text: str, anchor: str = "") -> str:
+    cleaned = re.sub(r"\s+", " ", text).replace("\u200b", "").strip()
+    lowered = cleaned.lower()
+    for prefix in NOISY_PREFIXES:
+        if lowered.startswith(prefix):
+            cleaned = cleaned[len(prefix) :].strip(" :-")
+            lowered = cleaned.lower()
+    for phrase in NOISY_INLINE_PHRASES:
+        cleaned = re.sub(rf"(?i)\b{re.escape(phrase)}\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    lowered = cleaned.lower()
+    if anchor:
+        anchor_index = lowered.find(anchor.lower())
+        if anchor_index > 0:
+            cleaned = cleaned[anchor_index:]
+    return cleaned
 
 
 def _score_text_match(
@@ -333,15 +500,30 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
     """Executor that prefers official documentation sitemaps and caches results."""
 
     def __init__(self) -> None:
-        self._client = httpx.Client(
-            follow_redirects=True,
-            timeout=20.0,
-            headers={"User-Agent": USER_AGENT},
-        )
+        self._client_kwargs = {
+            "follow_redirects": True,
+            "timeout": 20.0,
+            "headers": {"User-Agent": USER_AGENT},
+            "limits": httpx.Limits(max_keepalive_connections=12, max_connections=24),
+        }
+        self._client = httpx.Client(**self._client_kwargs)
         self._pages_cache: dict[str, list[DocsPage]] = {}
         self._preview_cache: dict[str, PagePreview] = {}
         self._page_title_hints: dict[str, str] = {}
+        self._github_markdown_paths: dict[str, str] = {}
         self._lock = threading.Lock()
+
+    def _new_async_client(self) -> httpx.AsyncClient:
+        return httpx.AsyncClient(**self._client_kwargs)
+
+    def _run_async(self, coroutine: Any) -> object:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coroutine)
+
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            return executor.submit(lambda: asyncio.run(coroutine)).result()
 
     def __call__(
         self,
@@ -398,10 +580,9 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
 
         if candidate_url.endswith("robots.txt"):
             sitemap_urls = re.findall(r"(?im)^Sitemap:\s*(\S+)\s*$", text)
-            urls: list[str] = []
-            for sitemap_url in sitemap_urls:
-                urls.extend(self._discover_from_candidate(source, sitemap_url))
-            return _dedupe(urls)
+            return self._run_async(
+                self._async_discover_from_sitemap_urls(source, sitemap_urls)
+            )
 
         if "<urlset" in text or "<sitemapindex" in text:
             return self._parse_sitemap_xml(source, text)
@@ -414,20 +595,30 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
         urls: list[str] = []
 
         if tag == "sitemapindex":
-            for location in root.findall(".//{*}loc"):
-                sitemap_url = (location.text or "").strip()
-                if not sitemap_url:
-                    continue
-                try:
-                    nested = self._client.get(sitemap_url)
-                    nested.raise_for_status()
-                    urls.extend(self._parse_sitemap_xml(source, nested.text))
-                except Exception:
-                    continue
+            sitemap_urls = [
+                (location.text or "").strip()
+                for location in root.findall(".//{*}loc")
+                if (location.text or "").strip()
+            ]
+            if not sitemap_urls:
+                return []
+
+            with ThreadPoolExecutor(
+                max_workers=min(MAX_SITEMAP_WORKERS, len(sitemap_urls))
+            ) as executor:
+                futures = {
+                    executor.submit(self._fetch_and_parse_nested_sitemap, source, sitemap_url): sitemap_url
+                    for sitemap_url in sitemap_urls
+                }
+                for future in as_completed(futures):
+                    try:
+                        urls.extend(future.result())
+                    except Exception:
+                        continue
         else:
             for location in root.findall(".//{*}loc"):
                 url = (location.text or "").strip()
-                if url and self._matches_known_domain(url, source.domains):
+                if url and self._is_supported_docs_url(url, source):
                     urls.append(url)
 
         return _dedupe(urls)
@@ -439,9 +630,51 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
         absolute_urls: list[str] = []
         for href in hrefs:
             absolute = urllib.parse.urljoin(source.home_url, href.strip())
-            if self._matches_known_domain(absolute, source.domains):
+            if self._is_supported_docs_url(absolute, source):
                 absolute_urls.append(absolute)
         return _dedupe(absolute_urls)
+
+    def _fetch_and_parse_nested_sitemap(
+        self,
+        source: DocsSource,
+        sitemap_url: str,
+    ) -> list[str]:
+        nested = self._client.get(sitemap_url)
+        nested.raise_for_status()
+        return self._parse_sitemap_xml(source, nested.text)
+
+    async def _async_discover_from_sitemap_urls(
+        self,
+        source: DocsSource,
+        sitemap_urls: list[str],
+    ) -> list[str]:
+        if not sitemap_urls:
+            return []
+
+        async with self._new_async_client() as client:
+            semaphore = asyncio.Semaphore(MAX_SITEMAP_WORKERS)
+
+            async def collect(sitemap_url: str) -> list[str]:
+                try:
+                    async with semaphore:
+                        response = await client.get(sitemap_url)
+                    response.raise_for_status()
+                except Exception:
+                    return []
+
+                text = response.text
+                if "<urlset" in text or "<sitemapindex" in text:
+                    return self._parse_sitemap_xml(source, text)
+                return []
+
+            nested_results = await asyncio.gather(
+                *(collect(sitemap_url) for sitemap_url in sitemap_urls)
+            )
+
+        urls: list[str] = []
+        for result in nested_results:
+            urls.extend(result)
+        return _dedupe(urls)
 
     def _discover_from_github_tree(self, source: DocsSource) -> list[str]:
         if not source.github_tree_api_url or not source.github_content_prefix:
@@ -459,8 +692,9 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
             url = self._docs_url_from_github_path(source, path)
             if url:
                 title_hint = self._title_hint_from_github_path(source, path)
-                if title_hint:
-                    with self._lock:
+                with self._lock:
+                    self._github_markdown_paths[url] = path
+                    if title_hint:
                         self._page_title_hints[url] = title_hint
                 urls.append(url)
         return _dedupe(urls)
@@ -493,7 +727,52 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
             netloc = urllib.parse.urlparse(url).netloc.lower()
         except Exception:
             return False
-        return any(domain in netloc for domain in allowed_domains)
+        return any(netloc == domain or netloc.endswith("." + domain) for domain in allowed_domains)
+
+    def _is_supported_docs_url(self, url: str, source: DocsSource) -> bool:
+        if not self._matches_known_domain(url, source.domains):
+            return False
+
+        parsed = urllib.parse.urlparse(url)
+        path = parsed.path.lower()
+        if any(path.endswith(extension) for extension in BAD_ASSET_EXTENSIONS):
+            return False
+        if parsed.scheme not in {"http", "https"}:
+            return False
+        return True
+
+    def _page_path_weight(self, page: DocsPage) -> int:
+        source = DOCS_SOURCE_BY_KEY[page.source_key]
+        normalized = page.url.lower()
+        score = 0
+        for fragment in source.preferred_url_fragments:
+            if fragment.lower() in normalized:
+                score += 4
+        for fragment in source.discouraged_url_fragments:
+            if fragment.lower() in normalized:
+                score -= 5
+        return score
+
+    def _markdown_raw_url(self, source: DocsSource, path: str) -> str:
+        if not source.github_repository or not source.github_ref:
+            raise ValueError("GitHub repository metadata is not configured.")
+        quoted_path = "/".join(urllib.parse.quote(part) for part in path.split("/"))
+        return (
+            f"https://raw.githubusercontent.com/"
+            f"{source.github_repository}/{source.github_ref}/{quoted_path}"
+        )
+
+    def _github_path_from_docs_url(self, source: DocsSource, url: str) -> str | None:
+        prefix = source.github_content_prefix
+        if not prefix:
+            return None
+
+        parsed = urllib.parse.urlparse(url)
+        relative = parsed.path.strip("/")
+        if not relative:
+            return None
+
+        return f"{prefix}{relative}.md"
 
     def _rank_pages(
         self,
@@ -506,7 +785,7 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
         for page in pages:
             decoded_url = urllib.parse.unquote(page.url).lower()
             compact_url = re.sub(r"[^a-z0-9]+", "", decoded_url)
-            score = 0
+            score = self._page_path_weight(page)
             for index, token_group in enumerate(query_token_groups):
                 group_score = 0
                 for token in token_group:
@@ -547,31 +826,223 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
             )
         )
 
+    def _build_preview(
+        self,
+        page: DocsPage,
+        *,
+        max_chars: int,
+        client: httpx.Client,
+    ) -> PagePreview:
+        source = DOCS_SOURCE_BY_KEY[page.source_key]
+        github_path = self._github_markdown_paths.get(page.url) or self._github_path_from_docs_url(
+            source,
+            page.url,
+        )
+        if github_path and source.github_repository and source.github_ref:
+            try:
+                return self._get_preview_from_markdown(
+                    source=source,
+                    page=page,
+                    path=github_path,
+                    max_chars=max_chars,
+                    client=client,
+                )
+            except Exception:
+                pass
+
+        response = client.get(page.url)
+        response.raise_for_status()
+        html_text = response.text
+        primary_html = _extract_primary_html(html_text)
+        heading_match = re.search(r"(?is)<h[1-3][^>]*>", primary_html)
+        if heading_match:
+            primary_html = primary_html[heading_match.start() :]
+        body_text = _strip_tags(primary_html)
+        title = _extract_title(html_text)
+        fallback_title = self._page_title_hints.get(page.url, "")
+        if fallback_title and title.lower().startswith("documentation | nestjs"):
+            title = fallback_title
+        headings = _extract_headings(primary_html)
+        anchor = headings[0] if headings else title
+        excerpt = _clean_excerpt(body_text, anchor=anchor)[: max(max_chars, 4000)].strip()
+        return PagePreview(
+            url=page.url,
+            title=title,
+            description=_extract_meta_description(html_text),
+            headings=headings,
+            excerpt=excerpt,
+        )
+
     def _get_preview(self, page: DocsPage, max_chars: int = 1200) -> PagePreview:
         with self._lock:
             cached = self._preview_cache.get(page.url)
             if cached is not None:
                 return cached
 
-        response = self._client.get(page.url)
+        preview = self._build_preview(page, max_chars=max_chars, client=self._client)
+        with self._lock:
+            self._preview_cache[page.url] = preview
+        return preview
+
+    def _get_preview_from_markdown(
+        self,
+        *,
+        source: DocsSource,
+        page: DocsPage,
+        path: str,
+        max_chars: int,
+        client: httpx.Client,
+    ) -> PagePreview:
+        response = client.get(self._markdown_raw_url(source, path))
+        response.raise_for_status()
+        markdown_text = response.text
+        headings = _extract_markdown_headings(markdown_text)
+        frontmatter_title = _extract_frontmatter_title(markdown_text)
+        title = (
+            frontmatter_title
+            or headings[0]
+            or self._page_title_hints.get(page.url, page.url)
+        )
+        plain_text = _strip_markdown(markdown_text)
+        excerpt = _clean_excerpt(plain_text, anchor=title)[: max(max_chars, 4000)].strip()
+        return PagePreview(
+            url=page.url,
+            title=title,
+            description="",
+            headings=headings,
+            excerpt=excerpt,
+        )
+
+    async def _async_get_preview_from_markdown(
+        self,
+        *,
+        source: DocsSource,
+        page: DocsPage,
+        path: str,
+        max_chars: int,
+        client: httpx.AsyncClient,
+    ) -> PagePreview:
+        response = await client.get(self._markdown_raw_url(source, path))
+        response.raise_for_status()
+        markdown_text = response.text
+        headings = _extract_markdown_headings(markdown_text)
+        frontmatter_title = _extract_frontmatter_title(markdown_text)
+        title = (
+            frontmatter_title
+            or headings[0]
+            or self._page_title_hints.get(page.url, page.url)
+        )
+        plain_text = _strip_markdown(markdown_text)
+        excerpt = _clean_excerpt(plain_text, anchor=title)[: max(max_chars, 4000)].strip()
+        return PagePreview(
+            url=page.url,
+            title=title,
+            description="",
+            headings=headings,
+            excerpt=excerpt,
+        )
+
+    async def _async_build_preview(
+        self,
+        page: DocsPage,
+        *,
+        max_chars: int,
+        client: httpx.AsyncClient,
+    ) -> PagePreview:
+        source = DOCS_SOURCE_BY_KEY[page.source_key]
+        github_path = self._github_markdown_paths.get(page.url) or self._github_path_from_docs_url(
+            source,
+            page.url,
+        )
+        if github_path and source.github_repository and source.github_ref:
+            try:
+                return await self._async_get_preview_from_markdown(
+                    source=source,
+                    page=page,
+                    path=github_path,
+                    max_chars=max_chars,
+                    client=client,
+                )
+            except Exception:
+                pass
+
+        response = await client.get(page.url)
         response.raise_for_status()
         html_text = response.text
-        body_text = _strip_tags(html_text)
-        excerpt = body_text[:max_chars].strip()
+        primary_html = _extract_primary_html(html_text)
+        heading_match = re.search(r"(?is)<h[1-3][^>]*>", primary_html)
+        if heading_match:
+            primary_html = primary_html[heading_match.start() :]
+        body_text = _strip_tags(primary_html)
         title = _extract_title(html_text)
         fallback_title = self._page_title_hints.get(page.url, "")
         if fallback_title and title.lower().startswith("documentation | nestjs"):
             title = fallback_title
-        preview = PagePreview(
+        headings = _extract_headings(primary_html)
+        anchor = headings[0] if headings else title
+        excerpt = _clean_excerpt(body_text, anchor=anchor)[: max(max_chars, 4000)].strip()
+        return PagePreview(
             url=page.url,
             title=title,
             description=_extract_meta_description(html_text),
-            headings=_extract_headings(html_text),
+            headings=headings,
             excerpt=excerpt,
         )
+
+    async def _async_get_preview_with_client(
+        self,
+        page: DocsPage,
+        *,
+        client: httpx.AsyncClient,
+        max_chars: int = 1200,
+    ) -> PagePreview:
         with self._lock:
+            cached = self._preview_cache.get(page.url)
+            if cached is not None:
+                return cached
+
+        preview = await self._async_build_preview(page, max_chars=max_chars, client=client)
+
+        with self._lock:
+            cached = self._preview_cache.get(page.url)
+            if cached is not None:
+                return cached
             self._preview_cache[page.url] = preview
-        return preview
+            return preview
+
+    async def _async_rescore_preview_candidates(
+        self,
+        preview_candidates: list[tuple[int, DocsPage]],
+        query_token_groups: list[list[str]],
+    ) -> list[tuple[int, DocsPage, PagePreview | None]]:
+        if not preview_candidates:
+            return []
+
+        async with self._new_async_client() as client:
+            semaphore = asyncio.Semaphore(MAX_PARALLEL_FETCHES)
+
+            async def collect_result(
+                base_score: int,
+                page: DocsPage,
+            ) -> tuple[int, DocsPage, PagePreview | None]:
+                preview: PagePreview | None = None
+                total_score = base_score
+                try:
+                    async with semaphore:
+                        preview = await self._async_get_preview_with_client(
+                            page,
+                            client=client,
+                        )
+                    total_score += self._score_preview(preview, query_token_groups)
+                except Exception:
+                    preview = None
+                return total_score, page, preview
+
+            tasks = [
+                collect_result(base_score, page)
+                for base_score, page in preview_candidates
+            ]
+            return await asyncio.gather(*tasks)
 
     def search(self, action: DocsSearchAction) -> DocsSearchObservation:
         sources = self._candidate_sources(action.framework)
@@ -584,16 +1055,14 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
 
         ranked_pages.sort(key=lambda item: (-item[0], len(item[1].url)))
         query_token_groups = _token_groups(action.query)
-        rescored_pages: list[tuple[int, DocsPage, PagePreview | None]] = []
-        for base_score, page in ranked_pages[: max(action.max_results * 6, 12)]:
-            preview: PagePreview | None = None
-            total_score = base_score
-            try:
-                preview = self._get_preview(page)
-                total_score += self._score_preview(preview, query_token_groups)
-            except Exception:
-                preview = None
-            rescored_pages.append((total_score, page, preview))
+        preview_budget = max(action.max_results * 2, 6)
+        preview_candidates = ranked_pages[:preview_budget]
+        rescored_pages = self._run_async(
+            self._async_rescore_preview_candidates(
+                preview_candidates,
+                query_token_groups,
+            )
+        )
 
         rescored_pages.sort(key=lambda item: (-item[0], len(item[1].url)))
         rescored_pages = rescored_pages[: action.max_results]
@@ -682,7 +1151,7 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
             f"Title: {preview.title or action.url}\n"
             f"URL: {action.url}\n"
             f"Headings: {', '.join(preview.headings) if preview.headings else '(none found)'}\n"
-            f"Excerpt:\n{preview.excerpt}"
+            f"Excerpt:\n{preview.excerpt[: action.max_chars]}"
         )
         return DocsFetchObservation.from_text(
             text=text,
@@ -690,7 +1159,7 @@ class DocsToolExecutor(ToolExecutor[DocsSearchAction | DocsFetchAction, Observat
             source=matched_source.key,
             title=preview.title,
             headings=preview.headings,
-            excerpt=preview.excerpt,
+            excerpt=preview.excerpt[: action.max_chars],
         )
 
 
