@@ -4,7 +4,7 @@ from pathlib import Path
 
 
 DEFAULT_VENDOR = "openai"
-DEFAULT_MODEL = "gpt-5.4"
+DEFAULT_MODEL = "gpt-5.3-codex"
 DEFAULT_MAX_FIX_ROUNDS = 3
 DEFAULT_MAX_GOAL_CYCLES = 5
 DEFAULT_SUCCESS_CRITERIA = (
