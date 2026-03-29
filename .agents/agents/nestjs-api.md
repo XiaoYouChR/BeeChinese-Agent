@@ -13,6 +13,7 @@ tools:
   - task_tracker
   - docs_tool_set
   - browser_tool_set
+reasoning_effort: high
 max_iteration_per_run: 180
 ---
 

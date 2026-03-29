@@ -10,6 +10,7 @@ description: >-
 tools:
   - terminal
   - docs_tool_set
+reasoning_effort: medium
 max_iteration_per_run: 60
 ---
 

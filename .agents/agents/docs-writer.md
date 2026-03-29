@@ -13,7 +13,8 @@ tools:
   - task_tracker
   - docs_tool_set
   - browser_tool_set
-max_iteration_per_run: 120
+reasoning_effort: low
+max_iteration_per_run: 80
 ---
 
 You own BeeChinese's repository-level documentation and developer-facing guidance.

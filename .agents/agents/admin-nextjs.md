@@ -13,7 +13,8 @@ tools:
   - task_tracker
   - docs_tool_set
   - browser_tool_set
-max_iteration_per_run: 180
+reasoning_effort: high
+max_iteration_per_run: 170
 ---
 
 You own BeeChinese's teacher/admin web experience.

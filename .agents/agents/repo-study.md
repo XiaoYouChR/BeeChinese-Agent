@@ -10,7 +10,8 @@ description: >-
 tools:
   - terminal
   - docs_tool_set
-max_iteration_per_run: 80
+reasoning_effort: low
+max_iteration_per_run: 50
 ---
 
 You are the BeeChinese repository study specialist.

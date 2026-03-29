@@ -77,6 +77,8 @@ LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 LOG_LEVEL_HELP = (
     "Logging level for BeeChinese runtime logs, such as DEBUG, INFO, WARNING, or ERROR."
 )
+ORCHESTRATOR_REASONING_EFFORT = "high"
+ORCHESTRATOR_MAX_ITERATIONS = 190
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = textwrap.dedent(
@@ -261,6 +263,14 @@ def _append_unique_skills(skills: list[Skill], additions: list[Skill]) -> list[S
         skills.append(skill)
         seen.add(skill.name)
     return skills
+
+
+def _definition_reasoning_effort(definition: AgentDefinition) -> str | None:
+    value = definition.metadata.get("reasoning_effort")
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized or None
 
 
 def _load_control_plane_skills(control_root: Path) -> list[Skill]:
@@ -616,7 +626,7 @@ class FileAgentRegistry:
         self.validate_required_agents()
         registered: list[str] = []
         for definition in self.definitions.values():
-            factory = agent_definition_to_factory(definition, work_dir=self.workspace)
+            factory = self.factory_for_definition(definition)
             was_registered = register_agent_if_absent(
                 name=definition.name,
                 factory_func=factory,
@@ -634,8 +644,23 @@ class FileAgentRegistry:
 
     def build_agent(self, name: str, llm: LLM) -> Agent:
         definition = self.definition_for(name)
-        factory = agent_definition_to_factory(definition, work_dir=self.workspace)
+        factory = self.factory_for_definition(definition)
         return factory(llm)
+
+    def reasoning_effort_for(self, name: str) -> str | None:
+        return _definition_reasoning_effort(self.definition_for(name))
+
+    def factory_for_definition(self, definition: AgentDefinition) -> Any:
+        base_factory = agent_definition_to_factory(definition, work_dir=self.workspace)
+        reasoning_effort = _definition_reasoning_effort(definition)
+        if not reasoning_effort:
+            return base_factory
+
+        def _factory(llm: LLM) -> Agent:
+            tuned_llm = llm.model_copy(update={"reasoning_effort": reasoning_effort})
+            return base_factory(tuned_llm)
+
+        return _factory
 
 
 class BeeChineseOrchestrator:
@@ -673,16 +698,32 @@ class BeeChineseOrchestrator:
             len(self.repo_skills),
         )
 
-    def _phase_llm(self, usage_id: str) -> LLM:
-        return self.llm.model_copy(update={"usage_id": usage_id})
+    def _phase_llm(
+        self,
+        usage_id: str,
+        *,
+        reasoning_effort: str | None = None,
+    ) -> LLM:
+        update: dict[str, Any] = {"usage_id": usage_id}
+        if reasoning_effort:
+            update["reasoning_effort"] = reasoning_effort
+        return self.llm.model_copy(update=update)
 
     def _run_named_agent(self, name: str, prompt: str) -> str:
         definition = self.registry.definition_for(name)
-        agent = self.registry.build_agent(name, self._phase_llm(name))
+        reasoning_effort = self.registry.reasoning_effort_for(name)
+        agent = self.registry.build_agent(
+            name,
+            self._phase_llm(
+                name,
+                reasoning_effort=reasoning_effort,
+            ),
+        )
         LOGGER.info(
-            "Starting agent=%s max_iterations=%s",
+            "Starting agent=%s max_iterations=%s reasoning_effort=%s",
             name,
             definition.max_iteration_per_run or 120,
+            reasoning_effort or getattr(self.llm, "reasoning_effort", None),
         )
         started_at = time.monotonic()
         conversation = Conversation(
@@ -746,7 +787,10 @@ class BeeChineseOrchestrator:
             system_message_suffix=ORCHESTRATOR_SYSTEM_PROMPT,
         )
         return Agent(
-            llm=self._phase_llm(usage_id),
+            llm=self._phase_llm(
+                usage_id,
+                reasoning_effort=ORCHESTRATOR_REASONING_EFFORT,
+            ),
             tools=tools,
             agent_context=agent_context,
             condenser=_build_condenser(self.llm, f"{usage_id}-condenser"),
@@ -851,7 +895,7 @@ class BeeChineseOrchestrator:
             agent=agent,
             workspace=self.workspace,
             visualizer=None,
-            max_iteration_per_run=200,
+            max_iteration_per_run=ORCHESTRATOR_MAX_ITERATIONS,
             delete_on_close=True,
         )
         try:
@@ -1026,6 +1070,9 @@ class BeeChineseOrchestrator:
             - Be strict and specific.
             - FAIL if required files are missing, scripts are broken, or docs contradict behavior.
             - Check the canonical BeeChinese product docs in docs/ when product intent or acceptance expectations are relevant.
+            - Prefer terminal-first deterministic checks and inspect the smallest relevant set of files.
+            - Use browser tools only when the task explicitly needs real page validation or local evidence is insufficient.
+            - For simple scaffolding or docs-only tasks, aim to finish within a handful of targeted checks instead of broad exploration.
             - If there are no material issues, return PASS with an empty issues list.
             - Confidence must be a number between 0 and 1.
             - Focus on whether this cycle's implementation is correct and whether it advances the stated goal safely.
