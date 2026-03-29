@@ -124,7 +124,7 @@ This does not require LLM login.
 The runtime uses the OpenHands SDK subscription login flow by default:
 
 ```python
-LLM.subscription_login(vendor="openai", model="gpt-5.4")
+LLM.subscription_login(vendor="openai", model="gpt-5.3-codex")
 ```
 
 Example:
@@ -141,7 +141,7 @@ You can swap vendor/model later with CLI arguments:
 ```bash
 ./.venv/bin/python tools/run_beechinese_agent.py run \
   --vendor openai \
-  --model gpt-5.4
+  --model gpt-5.3-codex
 ```
 
 Key continuous-run controls:
@@ -149,6 +149,8 @@ Key continuous-run controls:
 - `--success-criteria`: explicit completion bar for the overall goal.
 - `--max-goal-cycles`: maximum number of outer `study -> plan -> implement -> verify` cycles.
 - `--max-fix-rounds`: maximum repair rounds inside each outer cycle.
+
+If the installed OpenHands SDK rejects a model for subscription access, rerun with a supported value such as `gpt-5.3-codex`, or inspect the CLI error message for the supported model list detected from the installed SDK.
 
 ## Browsing policy
 

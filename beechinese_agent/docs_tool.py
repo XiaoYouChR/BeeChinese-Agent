@@ -1230,26 +1230,31 @@ class DocsFetchTool(ToolDefinition[DocsFetchAction, DocsFetchObservation]):
         ]
 
 
-class DocsToolSet(ToolDefinition[Action, Observation]):
-    """Tool set exposing fast preferred documentation search and fetch tools."""
-
-    _shared_executor: DocsToolExecutor | None = None
-    _lock = threading.Lock()
-
-    @classmethod
-    def create(
-        cls,
-        conv_state: "ConversationState",  # noqa: ARG003
-    ) -> Sequence[ToolDefinition]:
-        with cls._lock:
-            if cls._shared_executor is None:
-                cls._shared_executor = DocsToolExecutor()
-            executor = cls._shared_executor
-
-        tools: list[ToolDefinition] = []
-        tools.extend(DocsSearchTool.create(executor))
-        tools.extend(DocsFetchTool.create(executor))
-        return tools
+_DOCS_TOOL_EXECUTOR: DocsToolExecutor | None = None
+_DOCS_TOOL_EXECUTOR_LOCK = threading.Lock()
 
 
-register_tool(DocsToolSet.name, DocsToolSet)
+def _make_docs_tool_set(
+    conv_state: "ConversationState",  # noqa: ARG001
+) -> list[ToolDefinition]:
+    """Create the BeeChinese docs tool set using one shared executor."""
+    global _DOCS_TOOL_EXECUTOR
+
+    with _DOCS_TOOL_EXECUTOR_LOCK:
+        if _DOCS_TOOL_EXECUTOR is None:
+            _DOCS_TOOL_EXECUTOR = DocsToolExecutor()
+        executor = _DOCS_TOOL_EXECUTOR
+
+    tools: list[ToolDefinition] = []
+    tools.extend(DocsSearchTool.create(executor))
+    tools.extend(DocsFetchTool.create(executor))
+    return tools
+
+
+class DocsToolSet:
+    """Named handle for the registered BeeChinese documentation tool set."""
+
+    name = "docs_tool_set"
+
+
+register_tool(DocsToolSet.name, _make_docs_tool_set)

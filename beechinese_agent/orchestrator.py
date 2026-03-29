@@ -1167,8 +1167,38 @@ def validate_workspace(workspace: Path) -> str:
     return "\n".join(lines)
 
 
+def _supported_openai_subscription_models() -> tuple[str, ...]:
+    try:
+        from openhands.sdk.llm.auth.openai import OPENAI_CODEX_MODELS
+    except Exception:
+        return ()
+    return tuple(sorted(OPENAI_CODEX_MODELS))
+
+
 def build_llm(vendor: str, model: str) -> LLM:
-    return LLM.subscription_login(vendor=vendor, model=model)
+    if vendor == "openai":
+        supported_models = _supported_openai_subscription_models()
+        if supported_models and model not in supported_models:
+            supported = ", ".join(supported_models)
+            raise ValueError(
+                f"Model '{model}' is not supported by the installed OpenHands SDK subscription flow. "
+                f"Supported models: {supported}. "
+                f"Try '--model {DEFAULT_MODEL}' or another supported value."
+            )
+
+    try:
+        return LLM.subscription_login(vendor=vendor, model=model)
+    except ValueError as exc:
+        message = str(exc)
+        if vendor == "openai" and "not supported for subscription access" in message:
+            supported_models = _supported_openai_subscription_models()
+            supported = ", ".join(supported_models) if supported_models else "unknown"
+            raise ValueError(
+                f"OpenHands subscription login rejected model '{model}'. "
+                f"Supported models for this installed SDK: {supported}. "
+                f"Try '--model {DEFAULT_MODEL}'."
+            ) from exc
+        raise
 
 
 def build_parser() -> argparse.ArgumentParser:
