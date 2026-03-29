@@ -35,7 +35,9 @@ The future engineering target assumed by this repo is:
 ```text
 .
 ├── .agents/
-│   └── agents/                  # File-based OpenHands specialist agents
+│   ├── agents/                  # File-based OpenHands specialist agents
+│   └── skills/                  # Progressive-disclosure BeeChinese skills
+├── AGENTS.md                    # Repo-root always-on OpenHands guidance
 ├── .openhands/
 │   ├── AGENTS.md                # Repo-level BeeChinese guidance
 │   ├── pre-commit.sh            # Lightweight local verification script
@@ -79,7 +81,9 @@ The detailed BeeChinese product context is intentionally centralized instead of 
 - `docs/beechinese-acceptance.md`: cross-cutting acceptance cues for planning, implementation, and verification.
 - `docs/beechinese-agent-playbook.md`: task-splitting heuristics, owner mapping, and common failure modes for agent runs.
 
-`.openhands/AGENTS.md` remains the shorter repository entry point, but when product intent matters these docs should be treated as the default source of truth.
+The repo-root `AGENTS.md` is the concise always-on entry point. `.openhands/AGENTS.md` remains the fuller repository handbook, and these docs should be treated as the default source of truth when product intent matters.
+
+The runtime now also follows OpenHands' repo-root convention by keeping a concise [AGENTS.md](AGENTS.md) at the repository root, while the deeper BeeChinese product guidance is exposed through file-based skills under [`.agents/skills/`](.agents/skills).
 
 ## Workflow
 
@@ -113,7 +117,7 @@ bash .openhands/setup.sh
 
 ### 2. Validate the scaffolding
 
-This does not require LLM login.
+This validates the BeeChinese-Agent framework repository itself and does not require LLM login.
 
 ```bash
 ./.venv/bin/python tools/run_beechinese_agent.py validate
@@ -127,10 +131,13 @@ The runtime uses the OpenHands SDK subscription login flow by default:
 LLM.subscription_login(vendor="openai", model="gpt-5.3-codex")
 ```
 
+By default, runtime work is executed against `~/BeeChinese`. You can override that with `--workspace` or `BEECHINESE_AGENT_WORKSPACE`.
+
 Example:
 
 ```bash
 ./.venv/bin/python tools/run_beechinese_agent.py run \
+  --workspace ~/BeeChinese \
   --task "Review the BeeChinese agent framework and tighten any inconsistent docs or validation scripts." \
   --success-criteria "The repo guidance, validation scripts, and orchestrator behavior are aligned and the verifier passes." \
   --max-goal-cycles 5
@@ -149,6 +156,7 @@ Key continuous-run controls:
 - `--success-criteria`: explicit completion bar for the overall goal.
 - `--max-goal-cycles`: maximum number of outer `study -> plan -> implement -> verify` cycles.
 - `--max-fix-rounds`: maximum repair rounds inside each outer cycle.
+- `--workspace`: target BeeChinese product workspace, defaulting to `~/BeeChinese`.
 - `--log-level`: runtime log verbosity for BeeChinese orchestration status, defaulting to `INFO`.
 
 Example with more verbose runtime status:
@@ -161,6 +169,12 @@ Example with more verbose runtime status:
 ```
 
 If the installed OpenHands SDK rejects a model for subscription access, rerun with a supported value such as `gpt-5.3-codex`, or inspect the CLI error message for the supported model list detected from the installed SDK.
+
+If you prefer not to pass `--workspace` each time:
+
+```bash
+export BEECHINESE_AGENT_WORKSPACE=~/BeeChinese
+```
 
 ## Browsing policy
 
@@ -183,7 +197,8 @@ This scaffold is intentionally close to current OpenHands SDK patterns:
 - The parent orchestrator uses `TaskToolSet` for delegation.
 - Documentation lookup now prefers a custom `docs_tool_set` backed by preferred official docs sources and cached sitemap discovery.
 - For docs sites with weak sitemap support, the docs tool can fall back to official source metadata such as the NestJS docs repository tree before using browser fallback.
-- Repo guidance, canonical BeeChinese product docs, and the agent playbook are loaded as skills/context for the agent runtime.
+- A concise repo-root `AGENTS.md` supplies always-on control-plane guidance.
+- BeeChinese product context is exposed through file-based skills in `.agents/skills/`, which is closer to OpenHands' progressive-disclosure `SKILL.md` pattern than injecting every long product doc into every run.
 - The verifier loop is implemented at the Python orchestration layer for determinism.
 - An outer goal loop keeps repeating full cycles until the goal is complete or a safe stop condition is reached.
 

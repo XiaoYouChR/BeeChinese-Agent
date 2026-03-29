@@ -2,6 +2,8 @@
 
 This repository is the autonomous coding layer for BeeChinese. Treat it as the control plane that coordinates future full-stack development, not as the BeeChinese product codebase itself.
 
+The concise always-on runtime guidance now lives at the repo root in `AGENTS.md`, which matches OpenHands' repo-root convention. This `.openhands/AGENTS.md` file remains the fuller human-readable handbook.
+
 ## Product context
 
 BeeChinese is a Chinese-learning SaaS for primarily English-speaking international students. The long-term product shape includes:
@@ -20,6 +22,7 @@ Detailed product scope, priorities, and acceptance cues live in these canonical 
 - `docs/beechinese-feature-map.md`
 - `docs/beechinese-acceptance.md`
 - `docs/beechinese-agent-playbook.md`
+- `.agents/skills/beechinese-*/SKILL.md`
 
 For product-facing work:
 
@@ -43,6 +46,7 @@ Unless a task explicitly says otherwise, optimize for this future stack:
 
 - Local repository context comes first.
 - Treat the canonical BeeChinese product docs in `docs/` as the default source of truth for product intent.
+- Use `.agents/skills/` for progressive-disclosure BeeChinese context instead of forcing the full product docs into every prompt.
 - Prefer `docs_tool_set` for framework documentation lookup and use browser tools as fallback or for real-page validation.
 - Do not assume real BeeChinese app code already exists.
 - Prefer small, reviewable changes over speculative framework work.

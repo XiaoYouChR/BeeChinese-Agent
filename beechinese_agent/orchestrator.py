@@ -41,6 +41,7 @@ from openhands.sdk import (
 )
 from openhands.sdk.context import Skill
 from openhands.sdk.context.condenser import LLMSummarizingCondenser
+from openhands.sdk.context.skills import load_skills_from_dir
 from openhands.sdk.conversation import get_agent_final_response
 from openhands.sdk.subagent import AgentDefinition, register_agent_if_absent
 from openhands.tools.apply_patch import ApplyPatchTool
@@ -53,15 +54,19 @@ from openhands.tools.terminal import TerminalTool
 from beechinese_agent.config import (
     AGENTS_DIR,
     CANONICAL_CONTEXT_PATHS,
+    CONTROL_SKILLS_DIR,
     DEFAULT_EXAMPLE_TASK,
     DEFAULT_MAX_FIX_ROUNDS,
     DEFAULT_MAX_GOAL_CYCLES,
     DEFAULT_MODEL,
     DEFAULT_SUCCESS_CRITERIA,
     DEFAULT_VENDOR,
+    DEFAULT_WORKSPACE,
+    FRAMEWORK_ROOT,
     IMPLEMENTATION_AGENT_NAMES,
     OFFICIAL_DOC_HINT,
     REPO_GUIDANCE_PATH,
+    ROOT_AGENTS_PATH,
     REQUIRED_AGENT_NAMES,
 )
 from beechinese_agent.docs_tool import DocsToolSet
@@ -248,16 +253,47 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
         return default
 
 
-def load_repo_skills(workspace: Path) -> list[Skill]:
-    """Load project skills plus canonical BeeChinese repo/product guidance docs."""
-    skills = load_project_skills(workspace)
-    for relative_path in CANONICAL_CONTEXT_PATHS:
-        source = workspace / relative_path
-        if not source.exists():
+def _append_unique_skills(skills: list[Skill], additions: list[Skill]) -> list[Skill]:
+    seen = {skill.name for skill in skills}
+    for skill in additions:
+        if skill.name in seen:
             continue
-        canonical_skill = Skill.load(source)
-        if not any(skill.source == canonical_skill.source for skill in skills):
-            skills.append(canonical_skill)
+        skills.append(skill)
+        seen.add(skill.name)
+    return skills
+
+
+def _load_control_plane_skills(control_root: Path) -> list[Skill]:
+    """Load the control-repo guidance using official OpenHands skill conventions.
+
+    Keep always-on guidance small via a root-level AGENTS.md, and expose larger
+    BeeChinese product/context references through file-based AgentSkills under
+    .agents/skills for progressive disclosure.
+    """
+    skills: list[Skill] = []
+
+    root_agents = control_root / ROOT_AGENTS_PATH
+    if root_agents.exists():
+        skills.append(Skill.load(root_agents))
+
+    skill_dir = control_root / CONTROL_SKILLS_DIR
+    if skill_dir.exists():
+        repo_skills, knowledge_skills, agent_skills = load_skills_from_dir(skill_dir)
+        _append_unique_skills(
+            skills,
+            list(repo_skills.values())
+            + list(knowledge_skills.values())
+            + list(agent_skills.values()),
+        )
+
+    return skills
+
+
+def load_repo_skills(*, control_root: Path, workspace: Path) -> list[Skill]:
+    """Load runtime skills for the target workspace plus BeeChinese control-plane skills."""
+    skills = load_project_skills(workspace)
+    if control_root.resolve() != workspace.resolve():
+        _append_unique_skills(skills, _load_control_plane_skills(control_root))
     return skills
 
 
@@ -560,9 +596,10 @@ class RunReport:
 class FileAgentRegistry:
     """Loads, validates, and registers file-based agent definitions."""
 
-    def __init__(self, workspace: Path):
+    def __init__(self, *, control_root: Path, workspace: Path):
+        self.control_root = control_root
         self.workspace = workspace
-        self.agents_dir = workspace / AGENTS_DIR
+        self.agents_dir = control_root / AGENTS_DIR
         self.definitions = {
             definition.name: definition
             for definition in load_agents_from_dir(self.agents_dir)
@@ -608,22 +645,25 @@ class BeeChineseOrchestrator:
         self,
         *,
         workspace: Path,
+        control_root: Path = FRAMEWORK_ROOT,
         llm: LLM,
         max_fix_rounds: int = DEFAULT_MAX_FIX_ROUNDS,
         max_goal_cycles: int = DEFAULT_MAX_GOAL_CYCLES,
         enable_browser: bool = True,
     ) -> None:
         self.workspace = workspace
+        self.control_root = control_root
         self.llm = llm
         self.max_fix_rounds = max_fix_rounds
         self.max_goal_cycles = max_goal_cycles
         self.enable_browser = enable_browser
         patch_task_manager_stream_handling()
-        self.registry = FileAgentRegistry(workspace)
+        self.registry = FileAgentRegistry(control_root=control_root, workspace=workspace)
         self.registered_agents = self.registry.register_all()
-        self.repo_skills = load_repo_skills(self.workspace)
+        self.repo_skills = load_repo_skills(control_root=self.control_root, workspace=self.workspace)
         LOGGER.info(
-            "Initialized BeeChineseOrchestrator workspace=%s model=%s browser=%s max_goal_cycles=%s max_fix_rounds=%s registered_agents=%s repo_skills=%s",
+            "Initialized BeeChineseOrchestrator control_root=%s workspace=%s model=%s browser=%s max_goal_cycles=%s max_fix_rounds=%s registered_agents=%s repo_skills=%s",
+            self.control_root,
             self.workspace,
             getattr(self.llm, "model", "unknown"),
             self.enable_browser,
@@ -1319,22 +1359,29 @@ class BeeChineseOrchestrator:
         )
 
 
-def validate_workspace(workspace: Path) -> str:
-    registry = FileAgentRegistry(workspace)
+def validate_workspace(control_root: Path) -> str:
+    registry = FileAgentRegistry(control_root=control_root, workspace=control_root)
     registry.validate_required_agents()
-    skills = load_repo_skills(workspace)
-    guidance_path = workspace / REPO_GUIDANCE_PATH
+    skills = load_repo_skills(control_root=control_root, workspace=control_root)
+    root_agents_path = control_root / ROOT_AGENTS_PATH
+    guidance_path = control_root / REPO_GUIDANCE_PATH
+    control_skills_dir = control_root / CONTROL_SKILLS_DIR
     product_context_paths = [path for path in CANONICAL_CONTEXT_PATHS if path != REPO_GUIDANCE_PATH]
     canonical_docs_present = sum(
-        1 for relative_path in product_context_paths if (workspace / relative_path).exists()
+        1 for relative_path in product_context_paths if (control_root / relative_path).exists()
     )
+    control_skill_packages = 0
+    if control_skills_dir.exists():
+        control_skill_packages = len(list(control_skills_dir.rglob("SKILL.md")))
 
     lines = [
         "BeeChinese agent workspace validation passed.",
-        f"Workspace: {workspace}",
+        f"Framework root: {control_root}",
         f"Agents loaded: {', '.join(sorted(registry.definitions))}",
         f"Project skills loaded: {len(skills)}",
-        f"Canonical guidance present: {'yes' if guidance_path.exists() else 'no'}",
+        f"Root AGENTS.md present: {'yes' if root_agents_path.exists() else 'no'}",
+        f"Repo guidance present: {'yes' if guidance_path.exists() else 'no'}",
+        f"Control skill packages present: {control_skill_packages}",
         "Canonical product-context docs present: "
         f"{canonical_docs_present}/{len(product_context_paths)}",
         "Registered tool names available in code: "
@@ -1413,8 +1460,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_parser.add_argument(
         "--workspace",
-        default=str(Path(__file__).resolve().parents[1]),
-        help="Workspace path. Defaults to the repository root.",
+        default=os.environ.get("BEECHINESE_AGENT_WORKSPACE", str(DEFAULT_WORKSPACE)),
+        help="Target BeeChinese workspace path. Defaults to ~/BeeChinese or BEECHINESE_AGENT_WORKSPACE.",
     )
     run_parser.add_argument(
         "--max-fix-rounds",
@@ -1450,8 +1497,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     validate_parser.add_argument(
         "--workspace",
-        default=str(Path(__file__).resolve().parents[1]),
-        help="Workspace path. Defaults to the repository root.",
+        default=str(FRAMEWORK_ROOT),
+        help="Framework repository path to validate. Defaults to the current BeeChinese-Agent repository root.",
     )
 
     return parser
@@ -1463,15 +1510,22 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging(getattr(args, "log_level", "INFO"))
     command = args.command or "run"
     workspace = Path(getattr(args, "workspace")).resolve()
+    control_root = FRAMEWORK_ROOT.resolve()
 
     try:
         if command == "validate":
             print(validate_workspace(workspace))
             return 0
 
+        if not workspace.exists():
+            raise ValueError(
+                f"Workspace '{workspace}' does not exist. Create it first or pass --workspace explicitly."
+            )
+
         llm = build_llm(vendor=args.vendor, model=args.model)
         orchestrator = BeeChineseOrchestrator(
             workspace=workspace,
+            control_root=control_root,
             llm=llm,
             max_fix_rounds=args.max_fix_rounds,
             max_goal_cycles=args.max_goal_cycles,

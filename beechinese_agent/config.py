@@ -5,6 +5,8 @@ from pathlib import Path
 
 DEFAULT_VENDOR = "openai"
 DEFAULT_MODEL = "gpt-5.3-codex"
+FRAMEWORK_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_WORKSPACE = Path.home() / "BeeChinese"
 DEFAULT_MAX_FIX_ROUNDS = 3
 DEFAULT_MAX_GOAL_CYCLES = 5
 DEFAULT_SUCCESS_CRITERIA = (
@@ -40,6 +42,8 @@ IMPLEMENTATION_AGENT_NAMES = (
 )
 
 AGENTS_DIR = Path(".agents/agents")
+CONTROL_SKILLS_DIR = Path(".agents/skills")
+ROOT_AGENTS_PATH = Path("AGENTS.md")
 REPO_GUIDANCE_PATH = Path(".openhands/AGENTS.md")
 PRODUCT_BRIEF_PATH = Path("docs/beechinese-product-brief.md")
 FEATURE_MAP_PATH = Path("docs/beechinese-feature-map.md")

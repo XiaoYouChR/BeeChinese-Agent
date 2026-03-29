@@ -7,6 +7,7 @@ DEFAULT_PYTHON="${PYTHON_BIN:-python3}"
 mkdir -p \
   "$ROOT_DIR/.openhands" \
   "$ROOT_DIR/.agents/agents" \
+  "$ROOT_DIR/.agents/skills" \
   "$ROOT_DIR/docs" \
   "$ROOT_DIR/tools" \
   "$ROOT_DIR/beechinese_agent"
