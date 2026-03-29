@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import textwrap
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +46,7 @@ from openhands.sdk.subagent import AgentDefinition, register_agent_if_absent
 from openhands.tools.apply_patch import ApplyPatchTool
 from openhands.tools.browser_use import BrowserToolSet
 from openhands.tools.task import TaskToolSet
+from openhands.tools.task.manager import TaskManager
 from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
 
@@ -62,6 +65,13 @@ from beechinese_agent.config import (
     REQUIRED_AGENT_NAMES,
 )
 from beechinese_agent.docs_tool import DocsToolSet
+
+
+LOGGER = logging.getLogger("beechinese_agent")
+LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+LOG_LEVEL_HELP = (
+    "Logging level for BeeChinese runtime logs, such as DEBUG, INFO, WARNING, or ERROR."
+)
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = textwrap.dedent(
@@ -89,6 +99,64 @@ ORCHESTRATOR_SYSTEM_PROMPT = textwrap.dedent(
 
 class OrchestratorError(RuntimeError):
     """Raised when the BeeChinese orchestrator cannot continue safely."""
+
+
+def _llm_requires_streaming(llm: LLM) -> bool:
+    """Return True when the current LLM transport must keep stream enabled."""
+    base_url = str(getattr(llm, "base_url", "") or "")
+    return bool(getattr(llm, "stream", False)) and (
+        bool(getattr(llm, "_is_subscription", False))
+        or "chatgpt.com/backend-api/codex" in base_url
+    )
+
+
+def patch_task_manager_stream_handling() -> None:
+    """Patch OpenHands TaskManager to preserve stream=True for subscription LLMs.
+
+    OpenHands SDK v1.15.0 hardcodes `stream=False` for delegated sub-agents in
+    TaskToolSet. That breaks the OpenAI subscription/Codex transport, which
+    requires streaming requests. We keep the SDK default for normal models and
+    only override the behavior when the parent LLM clearly requires streaming.
+    """
+    if getattr(TaskManager, "_beechinese_stream_patch_applied", False):
+        return
+
+    original_method = TaskManager._get_sub_agent_from_factory
+
+    def _patched_get_sub_agent_from_factory(
+        self: TaskManager,
+        factory: Any,
+    ) -> Agent:
+        parent_llm = self.parent_conversation.agent.llm
+        if not _llm_requires_streaming(parent_llm):
+            return original_method(self, factory)
+
+        LOGGER.debug(
+            "Preserving stream=True for TaskToolSet sub-agent llm model=%s",
+            getattr(parent_llm, "model", "unknown"),
+        )
+        sub_agent_llm = parent_llm.model_copy(update={"stream": True})
+        sub_agent_llm.reset_metrics()
+
+        sub_agent = factory.factory_func(sub_agent_llm)
+        return sub_agent.model_copy(
+            update={"llm": sub_agent.llm.model_copy(update={"stream": True})}
+        )
+
+    TaskManager._get_sub_agent_from_factory = _patched_get_sub_agent_from_factory
+    TaskManager._beechinese_stream_patch_applied = True
+
+
+def configure_logging(log_level: str = "INFO") -> None:
+    level = getattr(logging, log_level.upper(), logging.INFO)
+    root_logger = logging.getLogger()
+    if not root_logger.handlers:
+        logging.basicConfig(level=level, format=LOG_FORMAT, datefmt="%H:%M:%S")
+    else:
+        root_logger.setLevel(level)
+        for handler in root_logger.handlers:
+            handler.setLevel(level)
+    LOGGER.setLevel(level)
 
 
 def _dedupe(values: list[str]) -> list[str]:
@@ -550,9 +618,20 @@ class BeeChineseOrchestrator:
         self.max_fix_rounds = max_fix_rounds
         self.max_goal_cycles = max_goal_cycles
         self.enable_browser = enable_browser
+        patch_task_manager_stream_handling()
         self.registry = FileAgentRegistry(workspace)
         self.registered_agents = self.registry.register_all()
         self.repo_skills = load_repo_skills(self.workspace)
+        LOGGER.info(
+            "Initialized BeeChineseOrchestrator workspace=%s model=%s browser=%s max_goal_cycles=%s max_fix_rounds=%s registered_agents=%s repo_skills=%s",
+            self.workspace,
+            getattr(self.llm, "model", "unknown"),
+            self.enable_browser,
+            self.max_goal_cycles,
+            self.max_fix_rounds,
+            ", ".join(self.registered_agents),
+            len(self.repo_skills),
+        )
 
     def _phase_llm(self, usage_id: str) -> LLM:
         return self.llm.model_copy(update={"usage_id": usage_id})
@@ -560,6 +639,12 @@ class BeeChineseOrchestrator:
     def _run_named_agent(self, name: str, prompt: str) -> str:
         definition = self.registry.definition_for(name)
         agent = self.registry.build_agent(name, self._phase_llm(name))
+        LOGGER.info(
+            "Starting agent=%s max_iterations=%s",
+            name,
+            definition.max_iteration_per_run or 120,
+        )
+        started_at = time.monotonic()
         conversation = Conversation(
             agent=agent,
             workspace=self.workspace,
@@ -574,6 +659,12 @@ class BeeChineseOrchestrator:
             response = get_agent_final_response(conversation.state.events).strip()
             if not response:
                 raise OrchestratorError(f"Agent '{name}' returned an empty response.")
+            LOGGER.info(
+                "Completed agent=%s duration=%.2fs response_chars=%s",
+                name,
+                time.monotonic() - started_at,
+                len(response),
+            )
             return response
         finally:
             conversation.close()
@@ -708,6 +799,14 @@ class BeeChineseOrchestrator:
         agent = self._build_orchestrator_agent(
             f"goal-cycle-{cycle_number}-round-{round_number + 1}"
         )
+        LOGGER.info(
+            "Starting implementation cycle=%s round=%s step_count=%s repair=%s",
+            cycle_number,
+            round_number + 1,
+            len(applicable_steps),
+            verifier_feedback is not None,
+        )
+        started_at = time.monotonic()
         conversation = Conversation(
             agent=agent,
             workspace=self.workspace,
@@ -721,6 +820,13 @@ class BeeChineseOrchestrator:
             response = get_agent_final_response(conversation.state.events).strip()
             if not response:
                 raise OrchestratorError("Orchestrator execution returned an empty response.")
+            LOGGER.info(
+                "Completed implementation cycle=%s round=%s duration=%.2fs response_chars=%s",
+                cycle_number,
+                round_number + 1,
+                time.monotonic() - started_at,
+                len(response),
+            )
             return response
         finally:
             conversation.close()
@@ -894,6 +1000,7 @@ class BeeChineseOrchestrator:
         cycle_number: int,
         cycle_history: str,
     ) -> CycleArtifact:
+        LOGGER.info("Starting goal cycle=%s", cycle_number)
         repo_summary = self._run_named_agent(
             "repo-study",
             self._build_repo_study_prompt(
@@ -903,6 +1010,7 @@ class BeeChineseOrchestrator:
                 cycle_history=cycle_history,
             ),
         )
+        LOGGER.info("Completed repo-study cycle=%s", cycle_number)
         plan = PlanArtifact.from_response(
             self._run_named_agent(
                 "planner",
@@ -916,7 +1024,19 @@ class BeeChineseOrchestrator:
             ),
             user_task=goal,
         )
+        LOGGER.info(
+            "Planner result cycle=%s goal_complete=%s step_count=%s summary=%s",
+            cycle_number,
+            plan.goal_complete,
+            len(plan.steps),
+            plan.summary or "(no summary)",
+        )
         if plan.goal_complete:
+            LOGGER.info(
+                "Cycle=%s marked complete by planner reason=%s",
+                cycle_number,
+                plan.goal_completion_reason or "(no reason provided)",
+            )
             return CycleArtifact(
                 cycle_number=cycle_number,
                 repo_summary=repo_summary,
@@ -930,6 +1050,11 @@ class BeeChineseOrchestrator:
         verifier_feedback: VerifierArtifact | None = None
 
         for round_number in range(self.max_fix_rounds + 1):
+            LOGGER.info(
+                "Entering cycle=%s implementation_round=%s",
+                cycle_number,
+                round_number + 1,
+            )
             execution_summaries.append(
                 self._run_orchestrator_execution(
                     goal=goal,
@@ -955,9 +1080,27 @@ class BeeChineseOrchestrator:
                 )
             )
             verifier_results.append(verifier)
+            LOGGER.info(
+                "Verifier result cycle=%s round=%s status=%s severity=%s issues=%s summary=%s",
+                cycle_number,
+                round_number + 1,
+                verifier.status,
+                verifier.severity,
+                len(verifier.issues),
+                verifier.summary or "(no summary)",
+            )
             if verifier.passed:
                 break
             verifier_feedback = verifier
+
+        final_verifier = verifier_results[-1] if verifier_results else None
+        LOGGER.info(
+            "Finished goal cycle=%s verifier_status=%s goal_complete=%s remaining_work_items=%s",
+            cycle_number,
+            final_verifier.status if final_verifier else "NOT_RUN",
+            plan.goal_complete,
+            len(plan.remaining_work),
+        )
 
         return CycleArtifact(
             cycle_number=cycle_number,
@@ -1019,6 +1162,11 @@ class BeeChineseOrchestrator:
         *,
         success_criteria: str = DEFAULT_SUCCESS_CRITERIA,
     ) -> RunReport:
+        LOGGER.info(
+            "Starting BeeChinese run task=%s success_criteria=%s",
+            task,
+            success_criteria,
+        )
         before_paths = _git_changed_paths(self.workspace)
         cycles: list[CycleArtifact] = []
         status = "PARTIAL"
@@ -1040,6 +1188,7 @@ class BeeChineseOrchestrator:
                 goal_reason = cycle.plan.goal_completion_reason or (
                     f"The planner marked the goal complete at cycle {cycle_number}."
                 )
+                LOGGER.info("Run completed by planner at cycle=%s", cycle_number)
                 break
 
             final_verifier = cycle.final_verifier
@@ -1048,6 +1197,7 @@ class BeeChineseOrchestrator:
                 goal_reason = (
                     f"Cycle {cycle_number} ended before a verifier result was captured."
                 )
+                LOGGER.error("Run failed because no verifier result was captured in cycle=%s", cycle_number)
                 break
 
             if not final_verifier.passed:
@@ -1056,10 +1206,20 @@ class BeeChineseOrchestrator:
                     f"Cycle {cycle_number} failed verification after "
                     f"{len(cycle.verifier_results)} implementation round(s)."
                 )
+                LOGGER.error(
+                    "Run failed verification at cycle=%s rounds=%s issues=%s",
+                    cycle_number,
+                    len(cycle.verifier_results),
+                    len(final_verifier.issues),
+                )
                 break
 
             goal_reason = cycle.plan.goal_completion_reason or (
                 f"Cycle {cycle_number} passed verification, but the planner still sees remaining work."
+            )
+            LOGGER.info(
+                "Cycle=%s passed verification but goal remains incomplete",
+                cycle_number,
             )
         else:
             if cycles and cycles[-1].final_verifier and cycles[-1].final_verifier.passed:
@@ -1068,11 +1228,19 @@ class BeeChineseOrchestrator:
                     f"Reached the safety limit of {self.max_goal_cycles} goal cycles "
                     "before the planner marked the goal complete."
                 )
+                LOGGER.warning(
+                    "Run reached goal-cycle safety limit=%s with partial completion",
+                    self.max_goal_cycles,
+                )
             else:
                 status = "FAIL"
                 goal_reason = (
                     f"Reached the safety limit of {self.max_goal_cycles} goal cycles "
                     "without a clean completion."
+                )
+                LOGGER.error(
+                    "Run reached goal-cycle safety limit=%s without clean completion",
+                    self.max_goal_cycles,
                 )
 
         after_paths = _git_changed_paths(self.workspace)
@@ -1127,6 +1295,15 @@ class BeeChineseOrchestrator:
             cycle.render_summary() for cycle in cycles if cycle.render_summary().strip()
         )
 
+        LOGGER.info(
+            "Finished BeeChinese run status=%s cycles_run=%s changed_files=%s checks=%s unresolved_risks=%s",
+            status,
+            len(cycles),
+            len(changed_files),
+            len(checks_run),
+            len(unresolved_risks),
+        )
+
         return RunReport(
             task=task,
             success_criteria=success_criteria,
@@ -1176,6 +1353,7 @@ def _supported_openai_subscription_models() -> tuple[str, ...]:
 
 
 def build_llm(vendor: str, model: str) -> LLM:
+    LOGGER.info("Building LLM vendor=%s model=%s", vendor, model)
     if vendor == "openai":
         supported_models = _supported_openai_subscription_models()
         if supported_models and model not in supported_models:
@@ -1205,9 +1383,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run or validate the BeeChinese OpenHands agent framework."
     )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("BEECHINESE_AGENT_LOG_LEVEL", "INFO"),
+        help=LOG_LEVEL_HELP,
+    )
     subparsers = parser.add_subparsers(dest="command", required=False)
 
     run_parser = subparsers.add_parser("run", help="Run a BeeChinese orchestrated task.")
+    run_parser.add_argument(
+        "--log-level",
+        default=os.environ.get("BEECHINESE_AGENT_LOG_LEVEL", "INFO"),
+        help=LOG_LEVEL_HELP,
+    )
     run_parser.add_argument(
         "--task",
         default=DEFAULT_EXAMPLE_TASK,
@@ -1256,6 +1444,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Validate repository structure, agent files, and guidance without using an LLM.",
     )
     validate_parser.add_argument(
+        "--log-level",
+        default=os.environ.get("BEECHINESE_AGENT_LOG_LEVEL", "INFO"),
+        help=LOG_LEVEL_HELP,
+    )
+    validate_parser.add_argument(
         "--workspace",
         default=str(Path(__file__).resolve().parents[1]),
         help="Workspace path. Defaults to the repository root.",
@@ -1267,6 +1460,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_logging(getattr(args, "log_level", "INFO"))
     command = args.command or "run"
     workspace = Path(getattr(args, "workspace")).resolve()
 

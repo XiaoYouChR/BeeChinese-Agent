@@ -149,6 +149,16 @@ Key continuous-run controls:
 - `--success-criteria`: explicit completion bar for the overall goal.
 - `--max-goal-cycles`: maximum number of outer `study -> plan -> implement -> verify` cycles.
 - `--max-fix-rounds`: maximum repair rounds inside each outer cycle.
+- `--log-level`: runtime log verbosity for BeeChinese orchestration status, defaulting to `INFO`.
+
+Example with more verbose runtime status:
+
+```bash
+./.venv/bin/python tools/run_beechinese_agent.py run \
+  --log-level DEBUG \
+  --task "Review the BeeChinese agent framework and summarize what should be fixed next." \
+  --success-criteria "The run produces a concrete, verifier-backed recommendation summary."
+```
 
 If the installed OpenHands SDK rejects a model for subscription access, rerun with a supported value such as `gpt-5.3-codex`, or inspect the CLI error message for the supported model list detected from the installed SDK.
 
