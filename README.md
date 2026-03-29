@@ -97,6 +97,10 @@ The orchestrator now runs in goal-driven outer cycles. Each cycle follows:
 6. If verification passes but the overall goal is still incomplete, the system starts another outer cycle with fresh study and planning.
 7. The run stops when the planner marks the goal complete, verification fails irrecoverably, or the configured outer-cycle safety limit is reached.
 
+For bounded tasks such as scaffolding cleanup, README alignment, workspace hygiene, or command normalization, the runtime now auto-selects a compact execution profile. That profile keeps fewer outer cycles, fewer repair rounds, tighter stuck-detection thresholds, and treats the first clean verifier `PASS` as completion so simple tasks do not spend an extra cycle re-proving they are done.
+
+The compact profile now also skips LLM-based `repo-study` and `planner` passes entirely in favor of a local preflight summary plus a deterministic minimal plan. That keeps more budget available for the actual implementation agent and a final targeted verifier pass.
+
 The final report always includes:
 
 - Modified summary
@@ -158,14 +162,36 @@ Key continuous-run controls:
 - `--max-fix-rounds`: maximum repair rounds inside each outer cycle.
 - `--workspace`: target BeeChinese product workspace, defaulting to `~/BeeChinese`.
 - `--log-level`: runtime log verbosity for BeeChinese orchestration status, defaulting to `INFO`.
+- `--show-events`: real-time OpenHands event stream, defaulting to `summary`, with `full` available for deeper debugging.
+
+`summary` mode is intentionally compact now: you still see which tool ran and whether it succeeded, but long terminal output and system-prompt noise stay out of the way unless you switch to `full`.
+
+For compact tasks, browser tools are also stripped from the default execution path unless you explicitly move into a broader task shape. That helps keep both token spend and wall-clock time focused on local coding work.
 
 Example with more verbose runtime status:
 
 ```bash
 ./.venv/bin/python tools/run_beechinese_agent.py run \
   --log-level DEBUG \
+  --show-events summary \
   --task "Review the BeeChinese agent framework and summarize what should be fixed next." \
   --success-criteria "The run produces a concrete, verifier-backed recommendation summary."
+```
+
+If you want to watch the agent step through tool calls in real time:
+
+```bash
+./.venv/bin/python tools/run_beechinese_agent.py run \
+  --log-level INFO \
+  --show-events summary \
+  --task "..." \
+  --success-criteria "..."
+```
+
+You can also set a default:
+
+```bash
+export BEECHINESE_AGENT_SHOW_EVENTS=summary
 ```
 
 If the installed OpenHands SDK rejects a model for subscription access, rerun with a supported value such as `gpt-5.3-codex`, or inspect the CLI error message for the supported model list detected from the installed SDK.
@@ -175,6 +201,12 @@ If you prefer not to pass `--workspace` each time:
 ```bash
 export BEECHINESE_AGENT_WORKSPACE=~/BeeChinese
 ```
+
+Recommended target-workspace hygiene:
+
+- Add a concise `~/BeeChinese/AGENTS.md` so OpenHands can retain product-repo memory across cycles.
+- Add a `~/BeeChinese/.gitignore` before heavier runs so `node_modules/`, `.venv/`, `dist/`, and IDE files do not pollute git status.
+- The orchestrator report now omits common runtime/dependency artifacts from `Changed files` and lists them separately when present.
 
 ## Browsing policy
 

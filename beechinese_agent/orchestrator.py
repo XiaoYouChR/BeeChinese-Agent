@@ -13,7 +13,7 @@ import textwrap
 import time
 import warnings
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 os.environ.setdefault("OPENHANDS_SUPPRESS_BANNER", "1")
@@ -50,6 +50,7 @@ from openhands.tools.task import TaskToolSet
 from openhands.tools.task.manager import TaskManager
 from openhands.tools.task_tracker import TaskTrackerTool
 from openhands.tools.terminal import TerminalTool
+from openhands.tools.terminal.constants import CMD_OUTPUT_PS1_END
 
 from beechinese_agent.config import (
     AGENTS_DIR,
@@ -70,6 +71,10 @@ from beechinese_agent.config import (
     REQUIRED_AGENT_NAMES,
 )
 from beechinese_agent.docs_tool import DocsToolSet
+from beechinese_agent.event_visualizer import (
+    EventStreamMode,
+    LoggingConversationVisualizer,
+)
 
 
 LOGGER = logging.getLogger("beechinese_agent")
@@ -77,8 +82,83 @@ LOG_FORMAT = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 LOG_LEVEL_HELP = (
     "Logging level for BeeChinese runtime logs, such as DEBUG, INFO, WARNING, or ERROR."
 )
+EVENT_STREAM_HELP = (
+    "Print OpenHands conversation events in real time. "
+    "Use 'summary' for concise per-event logs, 'full' for more verbose content, or 'off' to disable."
+)
 ORCHESTRATOR_REASONING_EFFORT = "high"
 ORCHESTRATOR_MAX_ITERATIONS = 190
+COMPACT_ORCHESTRATOR_MAX_ITERATIONS = 90
+REPORT_IGNORED_DIR_NAMES = {
+    ".idea",
+    ".mypy_cache",
+    ".next",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    "__pycache__",
+    "coverage",
+    "dist",
+    "htmlcov",
+    "node_modules",
+}
+REPORT_IGNORED_FILE_NAMES = {
+    ".DS_Store",
+    "Thumbs.db",
+}
+REPORT_IGNORED_FILE_SUFFIXES = {
+    ".log",
+    ".pyc",
+    ".pyo",
+}
+SIMPLE_TASK_KEYWORDS = {
+    "bootstrap",
+    "build command",
+    "docs",
+    "documentation",
+    "guidance",
+    "health endpoint",
+    "normalize",
+    "normalise",
+    "placeholder",
+    "readme",
+    "run command",
+    "runnable scaffold",
+    "scaffold",
+    "scaffolding",
+    "setup",
+    "skeleton",
+    "workspace skeleton",
+}
+COMPLEX_TASK_KEYWORDS = {
+    "ai tutor",
+    "auth",
+    "community",
+    "course",
+    "exercise",
+    "expert ai",
+    "forum",
+    "grading",
+    "login",
+    "order",
+    "payment",
+    "progress",
+    "pronunciation",
+    "teacher",
+    "video",
+}
+COMPACT_DEFAULT_STUCK_THRESHOLDS = {
+    "action_observation": 3,
+    "action_error": 2,
+    "monologue": 2,
+    "alternating_pattern": 4,
+}
+COMPACT_VERIFIER_STUCK_THRESHOLDS = {
+    "action_observation": 2,
+    "action_error": 2,
+    "monologue": 2,
+    "alternating_pattern": 4,
+}
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = textwrap.dedent(
@@ -106,6 +186,23 @@ ORCHESTRATOR_SYSTEM_PROMPT = textwrap.dedent(
 
 class OrchestratorError(RuntimeError):
     """Raised when the BeeChinese orchestrator cannot continue safely."""
+
+
+@dataclass(slots=True)
+class RunProfile:
+    """Execution profile used to keep bounded tasks from over-exploring."""
+
+    name: str
+    simple_task: bool
+    single_cycle_completion: bool
+    use_local_preflight: bool
+    disable_browser_tools: bool
+    effective_max_fix_rounds: int
+    effective_max_goal_cycles: int
+    orchestrator_max_iterations: int
+    orchestrator_stuck_thresholds: dict[str, int] | None = None
+    named_agent_iteration_caps: dict[str, int] = field(default_factory=dict)
+    named_agent_stuck_thresholds: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 def _llm_requires_streaming(llm: LLM) -> bool:
@@ -154,6 +251,53 @@ def patch_task_manager_stream_handling() -> None:
     TaskManager._beechinese_stream_patch_applied = True
 
 
+def patch_subprocess_terminal_prompt_sync() -> None:
+    """Patch OpenHands subprocess terminals to wait briefly for PS1 metadata.
+
+    OpenHands v1.15.0 occasionally logs warnings like:
+    "Expected exactly one PS1 metadata block BEFORE the execution of a command,
+    but got 0"
+    when a prior `clear_screen()` nudges bash with a newline but the prompt
+    metadata has not yet re-entered the PTY buffer before the next command is
+    issued. The command still often works, but the warning is noisy and can
+    make command-state tracking less stable for no-output commands.
+
+    We keep the upstream behavior, then add a short prompt-sync wait only when
+    the visible buffer still lacks the PS1 end marker after clear_screen.
+    """
+    from openhands.tools.terminal.terminal.subprocess_terminal import (
+        SubprocessTerminal,
+    )
+
+    if getattr(SubprocessTerminal, "_beechinese_prompt_sync_patch_applied", False):
+        return
+
+    original_clear_screen = SubprocessTerminal.clear_screen
+
+    def _patched_clear_screen(self: Any) -> None:
+        original_clear_screen(self)
+
+        try:
+            with self.output_lock:
+                content = "".join(self.output_buffer)
+            if content.rstrip().endswith(CMD_OUTPUT_PS1_END.rstrip()):
+                return
+
+            if self._wait_for_prompt(timeout=0.25):
+                return
+
+            self._write_pty(b"\n")
+            self._wait_for_prompt(timeout=0.5)
+        except Exception:
+            LOGGER.debug(
+                "SubprocessTerminal prompt-sync patch could not confirm a PS1 prompt after clear_screen.",
+                exc_info=True,
+            )
+
+    SubprocessTerminal.clear_screen = _patched_clear_screen
+    SubprocessTerminal._beechinese_prompt_sync_patch_applied = True
+
+
 def configure_logging(log_level: str = "INFO") -> None:
     level = getattr(logging, log_level.upper(), logging.INFO)
     root_logger = logging.getLogger()
@@ -176,6 +320,188 @@ def _dedupe(values: list[str]) -> list[str]:
         result.append(cleaned)
         seen.add(cleaned)
     return result
+
+
+def _keyword_hits(text: str, keywords: set[str]) -> int:
+    normalized = text.lower()
+    return sum(1 for keyword in keywords if keyword in normalized)
+
+
+def build_run_profile(
+    *,
+    task: str,
+    success_criteria: str,
+    requested_max_fix_rounds: int,
+    requested_max_goal_cycles: int,
+) -> RunProfile:
+    """Adapt execution intensity to the likely scope of the current task."""
+    haystack = f"{task}\n{success_criteria}".lower()
+    simple_hits = _keyword_hits(haystack, SIMPLE_TASK_KEYWORDS)
+    complex_hits = _keyword_hits(haystack, COMPLEX_TASK_KEYWORDS)
+    is_simple_task = simple_hits >= 2 and complex_hits <= 1
+
+    if not is_simple_task:
+        return RunProfile(
+            name="standard",
+            simple_task=False,
+            single_cycle_completion=False,
+            use_local_preflight=False,
+            disable_browser_tools=False,
+            effective_max_fix_rounds=max(0, requested_max_fix_rounds),
+            effective_max_goal_cycles=max(1, requested_max_goal_cycles),
+            orchestrator_max_iterations=ORCHESTRATOR_MAX_ITERATIONS,
+        )
+
+    return RunProfile(
+        name="compact",
+        simple_task=True,
+        single_cycle_completion=True,
+        use_local_preflight=True,
+        disable_browser_tools=True,
+        effective_max_fix_rounds=min(max(0, requested_max_fix_rounds), 1),
+        effective_max_goal_cycles=1,
+        orchestrator_max_iterations=70,
+        orchestrator_stuck_thresholds=COMPACT_DEFAULT_STUCK_THRESHOLDS,
+        named_agent_iteration_caps={
+            "repo-study": 12,
+            "planner": 16,
+            "verifier": 12,
+            "docs-writer": 40,
+            "sdk-platform": 90,
+            "nestjs-api": 90,
+            "fastapi-ai": 90,
+            "taro-frontend": 90,
+            "admin-nextjs": 90,
+        },
+        named_agent_stuck_thresholds={
+            "repo-study": COMPACT_DEFAULT_STUCK_THRESHOLDS,
+            "planner": COMPACT_DEFAULT_STUCK_THRESHOLDS,
+            "verifier": COMPACT_VERIFIER_STUCK_THRESHOLDS,
+            "__default__": COMPACT_DEFAULT_STUCK_THRESHOLDS,
+        },
+    )
+
+
+def _existing_paths_summary(workspace: Path) -> str:
+    interesting_paths = [
+        Path("README.md"),
+        Path("AGENTS.md"),
+        Path(".gitignore"),
+        Path("docs"),
+        Path("apps/taro-user"),
+        Path("apps/admin-web"),
+        Path("services/nest-api"),
+        Path("services/fastapi-ai"),
+    ]
+    entries: list[str] = []
+    for relative_path in interesting_paths:
+        absolute_path = workspace / relative_path
+        if absolute_path.exists():
+            kind = "dir" if absolute_path.is_dir() else "file"
+            entries.append(f"{relative_path} ({kind})")
+    return ", ".join(entries) if entries else "No standard BeeChinese scaffold paths exist yet."
+
+
+def _top_level_entries_summary(workspace: Path, limit: int = 10) -> str:
+    try:
+        entries = sorted(path.name for path in workspace.iterdir())
+    except FileNotFoundError:
+        return "(workspace missing)"
+    if not entries:
+        return "(empty workspace)"
+    preview = entries[:limit]
+    suffix = "" if len(entries) <= limit else f", ... (+{len(entries) - limit} more)"
+    return ", ".join(preview) + suffix
+
+
+def _simple_task_owners(task: str, success_criteria: str) -> list[str]:
+    haystack = f"{task}\n{success_criteria}".lower()
+    owners: list[str] = []
+
+    def _maybe_add(owner: str, keywords: tuple[str, ...]) -> None:
+        if any(keyword in haystack for keyword in keywords) and owner not in owners:
+            owners.append(owner)
+
+    _maybe_add("sdk-platform", ("openhands", "python", "setup", "workspace", "scaffold"))
+    _maybe_add("nestjs-api", ("nest", "nestjs", "nest-api", "backend", "api", "service"))
+    _maybe_add("fastapi-ai", ("fastapi", "ai service", "fastapi-ai"))
+    _maybe_add("taro-frontend", ("taro", "mini program", "learner-facing"))
+    _maybe_add("admin-nextjs", ("next.js", "admin", "teacher"))
+    _maybe_add("docs-writer", ("readme", "docs", "documentation", "guidance", "wording"))
+
+    if not owners:
+        owners.append("sdk-platform")
+    if owners and owners[-1] != "docs-writer":
+        if any(token in haystack for token in ("readme", "docs", "documentation", "guidance", "wording", "honest", "accurate")):
+            owners.append("docs-writer")
+    return owners
+
+
+def _local_plan_for_simple_task(
+    *,
+    task: str,
+    success_criteria: str,
+    workspace: Path,
+) -> PlanArtifact:
+    owners = _simple_task_owners(task, success_criteria)
+    top_level = _top_level_entries_summary(workspace)
+    existing_paths = _existing_paths_summary(workspace)
+    steps: list[PlanStep] = []
+    for index, owner in enumerate(owners, start=1):
+        steps.append(
+            PlanStep(
+                id=f"step-{index}",
+                owner=owner,
+                title=f"{owner} implementation slice",
+                deliverable=task,
+                acceptance_criteria=[
+                    success_criteria,
+                    "Keep the change narrowly scoped to the current bounded task.",
+                ],
+                dependencies=[f"step-{index - 1}"] if index > 1 else [],
+            )
+        )
+
+    checks: list[str] = []
+    if "nestjs-api" in owners:
+        checks.append("cd services/nest-api && npm run build")
+    if "fastapi-ai" in owners:
+        checks.append("cd services/fastapi-ai && python3 -m compileall app")
+    if "docs-writer" in owners:
+        checks.append("Review README files for truthful scaffold wording and accurate commands")
+
+    risks: list[str] = []
+    if not (workspace / "docs").exists():
+        risks.append(
+            "Target workspace docs/ is missing, so product-intent cues are inherited mostly from the control-plane skills."
+        )
+
+    repo_summary = (
+        "Compact local preflight summary:\n"
+        f"- Top-level entries: {top_level}\n"
+        f"- Standard BeeChinese paths present: {existing_paths}\n"
+        f"- Intended owners: {', '.join(owners)}"
+    )
+    return PlanArtifact(
+        goal=task,
+        summary="Compact local plan for a bounded scaffolding/docs/normalization task.",
+        goal_complete=False,
+        completion_confidence=0.0,
+        goal_completion_reason=(
+            "This bounded task still needs implementation, but it should usually finish in one clean cycle."
+        ),
+        remaining_work=[task],
+        steps=steps,
+        checks=checks,
+        risks=risks,
+        notes_for_orchestrator=[
+            "Skip broad exploration and delegate directly to the listed owners.",
+            "Prefer one clean implementation pass followed by a tight verifier pass.",
+            "Avoid repeated install/start variants once a command path works.",
+            repo_summary,
+        ],
+        raw_response=repo_summary,
+    )
 
 
 def _extract_json_object(text: str) -> dict[str, Any]:
@@ -226,6 +552,41 @@ def _git_changed_paths(workspace: Path) -> set[str]:
             payload = payload.split(" -> ", maxsplit=1)[1]
         changed.add(payload)
     return changed
+
+
+def _artifact_bucket_for_path(path: str) -> str | None:
+    normalized = path.strip().replace("\\", "/")
+    if not normalized:
+        return None
+
+    parts = PurePosixPath(normalized).parts
+    for index, part in enumerate(parts):
+        if part in REPORT_IGNORED_DIR_NAMES:
+            return "/".join(parts[: index + 1]) + "/"
+
+    filename = parts[-1] if parts else normalized
+    if filename in REPORT_IGNORED_FILE_NAMES:
+        return normalized
+    if any(filename.endswith(suffix) for suffix in REPORT_IGNORED_FILE_SUFFIXES):
+        return normalized
+    return None
+
+
+def _split_changed_paths_for_report(paths: set[str]) -> tuple[list[str], list[str]]:
+    reportable: list[str] = []
+    omitted: list[str] = []
+    seen_omitted: set[str] = set()
+
+    for path in sorted(paths):
+        artifact_bucket = _artifact_bucket_for_path(path)
+        if artifact_bucket is None:
+            reportable.append(path)
+            continue
+        if artifact_bucket not in seen_omitted:
+            omitted.append(artifact_bucket)
+            seen_omitted.add(artifact_bucket)
+
+    return reportable, omitted
 
 
 def _build_condenser(llm: LLM, usage_id: str) -> LLMSummarizingCondenser:
@@ -556,6 +917,7 @@ class RunReport:
     goal_reason: str
     modified_summary: str
     changed_files: list[str]
+    omitted_runtime_artifacts: list[str]
     checks_run: list[str]
     unresolved_risks: list[str]
     next_steps: list[str]
@@ -582,6 +944,10 @@ class RunReport:
             lines.extend(f"- {path}" for path in self.changed_files)
         else:
             lines.append("- No new file deltas were detected against the starting git status snapshot.")
+
+        if self.omitted_runtime_artifacts:
+            lines.extend(["", "Omitted runtime/dependency artifacts:"])
+            lines.extend(f"- {path}" for path in self.omitted_runtime_artifacts)
 
         lines.extend(["", "Checks run:"])
         if self.checks_run:
@@ -675,6 +1041,7 @@ class BeeChineseOrchestrator:
         max_fix_rounds: int = DEFAULT_MAX_FIX_ROUNDS,
         max_goal_cycles: int = DEFAULT_MAX_GOAL_CYCLES,
         enable_browser: bool = True,
+        event_stream: EventStreamMode = "off",
     ) -> None:
         self.workspace = workspace
         self.control_root = control_root
@@ -682,21 +1049,72 @@ class BeeChineseOrchestrator:
         self.max_fix_rounds = max_fix_rounds
         self.max_goal_cycles = max_goal_cycles
         self.enable_browser = enable_browser
+        self.event_stream = event_stream
+        self._active_run_profile: RunProfile | None = None
         patch_task_manager_stream_handling()
+        patch_subprocess_terminal_prompt_sync()
         self.registry = FileAgentRegistry(control_root=control_root, workspace=workspace)
         self.registered_agents = self.registry.register_all()
         self.repo_skills = load_repo_skills(control_root=self.control_root, workspace=self.workspace)
         LOGGER.info(
-            "Initialized BeeChineseOrchestrator control_root=%s workspace=%s model=%s browser=%s max_goal_cycles=%s max_fix_rounds=%s registered_agents=%s repo_skills=%s",
+            "Initialized BeeChineseOrchestrator control_root=%s workspace=%s model=%s browser=%s event_stream=%s max_goal_cycles=%s max_fix_rounds=%s registered_agents=%s repo_skills=%s",
             self.control_root,
             self.workspace,
             getattr(self.llm, "model", "unknown"),
             self.enable_browser,
+            self.event_stream,
             self.max_goal_cycles,
             self.max_fix_rounds,
             ", ".join(self.registered_agents),
             len(self.repo_skills),
         )
+
+    def _run_profile(self) -> RunProfile:
+        if self._active_run_profile is not None:
+            return self._active_run_profile
+        return RunProfile(
+            name="standard",
+            simple_task=False,
+            single_cycle_completion=False,
+            use_local_preflight=False,
+            disable_browser_tools=False,
+            effective_max_fix_rounds=max(0, self.max_fix_rounds),
+            effective_max_goal_cycles=max(1, self.max_goal_cycles),
+            orchestrator_max_iterations=ORCHESTRATOR_MAX_ITERATIONS,
+        )
+
+    def _named_agent_max_iterations(self, name: str, default: int) -> int:
+        profile = self._run_profile()
+        cap = profile.named_agent_iteration_caps.get(name)
+        if cap is None:
+            return default
+        return min(default, cap)
+
+    def _named_agent_stuck_thresholds(self, name: str) -> dict[str, int] | None:
+        profile = self._run_profile()
+        thresholds = profile.named_agent_stuck_thresholds.get(name)
+        if thresholds is not None:
+            return dict(thresholds)
+        thresholds = profile.named_agent_stuck_thresholds.get("__default__")
+        if thresholds is not None:
+            return dict(thresholds)
+        return None
+
+    def _orchestrator_max_iterations(self) -> int:
+        return self._run_profile().orchestrator_max_iterations
+
+    def _orchestrator_stuck_thresholds(self) -> dict[str, int] | None:
+        thresholds = self._run_profile().orchestrator_stuck_thresholds
+        return dict(thresholds) if thresholds is not None else None
+
+    def _effective_definition(self, name: str) -> AgentDefinition:
+        definition = self.registry.definition_for(name)
+        if not self._run_profile().disable_browser_tools:
+            return definition
+        if BrowserToolSet.name not in definition.tools:
+            return definition
+        filtered_tools = [tool for tool in definition.tools if tool != BrowserToolSet.name]
+        return definition.model_copy(update={"tools": filtered_tools})
 
     def _phase_llm(
         self,
@@ -709,29 +1127,39 @@ class BeeChineseOrchestrator:
             update["reasoning_effort"] = reasoning_effort
         return self.llm.model_copy(update=update)
 
+    def _make_visualizer(self, label: str) -> LoggingConversationVisualizer | None:
+        if self.event_stream == "off":
+            return None
+        return LoggingConversationVisualizer(label=label, mode=self.event_stream)
+
     def _run_named_agent(self, name: str, prompt: str) -> str:
-        definition = self.registry.definition_for(name)
-        reasoning_effort = self.registry.reasoning_effort_for(name)
-        agent = self.registry.build_agent(
+        definition = self._effective_definition(name)
+        reasoning_effort = _definition_reasoning_effort(definition)
+        max_iterations = self._named_agent_max_iterations(
             name,
+            definition.max_iteration_per_run or 120,
+        )
+        stuck_thresholds = self._named_agent_stuck_thresholds(name)
+        agent = self.registry.factory_for_definition(definition)(
             self._phase_llm(
                 name,
                 reasoning_effort=reasoning_effort,
-            ),
+            )
         )
         LOGGER.info(
             "Starting agent=%s max_iterations=%s reasoning_effort=%s",
             name,
-            definition.max_iteration_per_run or 120,
+            max_iterations,
             reasoning_effort or getattr(self.llm, "reasoning_effort", None),
         )
         started_at = time.monotonic()
         conversation = Conversation(
             agent=agent,
             workspace=self.workspace,
-            visualizer=None,
+            visualizer=self._make_visualizer(name),
             hook_config=definition.hooks,
-            max_iteration_per_run=definition.max_iteration_per_run or 120,
+            max_iteration_per_run=max_iterations,
+            stuck_detection_thresholds=stuck_thresholds,
             delete_on_close=True,
         )
         try:
@@ -779,7 +1207,7 @@ class BeeChineseOrchestrator:
             Tool(name=TaskTrackerTool.name),
             Tool(name=DocsToolSet.name),
         ]
-        if self.enable_browser:
+        if self.enable_browser and not self._run_profile().disable_browser_tools:
             tools.append(Tool(name=BrowserToolSet.name))
 
         agent_context = AgentContext(
@@ -876,6 +1304,7 @@ class BeeChineseOrchestrator:
             - Only browse when docs_tool_set and local repo context are insufficient, or when a real web page needs validation.
             - {OFFICIAL_DOC_HINT}
             - When verifier feedback exists, repair the listed issues first and avoid unrelated refactors.
+            - {"This is a bounded scaffolding/docs/normalization task, so optimize for one clean pass, avoid repeated installs, avoid equivalent startup variants, and stop as soon as the success criteria are met." if self._run_profile().simple_task else "Keep implementation tightly aligned with the stated goal and avoid unnecessary side quests."}
             - Finish with a concise summary covering completed work, any specialist-run checks, remaining unknowns, and what is still left for the overall goal if anything.
             """
         ).strip()
@@ -894,8 +1323,11 @@ class BeeChineseOrchestrator:
         conversation = Conversation(
             agent=agent,
             workspace=self.workspace,
-            visualizer=None,
-            max_iteration_per_run=ORCHESTRATOR_MAX_ITERATIONS,
+            visualizer=self._make_visualizer(
+                f"orchestrator cycle {cycle_number} round {round_number + 1}"
+            ),
+            max_iteration_per_run=self._orchestrator_max_iterations(),
+            stuck_detection_thresholds=self._orchestrator_stuck_thresholds(),
             delete_on_close=True,
         )
         try:
@@ -948,6 +1380,7 @@ class BeeChineseOrchestrator:
             - Do not modify files.
             - Mention if the repo is mostly blank or scaffold-only.
             - Account for prior cycle progress and do not ignore already completed work.
+            - {"This is a bounded scaffolding/docs/normalization task; keep the report short and focus only on the files and commands that matter for this goal." if self._run_profile().simple_task else "Keep the report concise and decision-oriented."}
             """
         ).strip()
 
@@ -1013,6 +1446,7 @@ class BeeChineseOrchestrator:
             - Include the most useful validation commands in "checks".
             - Reflect the long-term BeeChinese stack: Taro + Next.js + NestJS + FastAPI + PostgreSQL + Redis + MinIO.
             - Keep the plan aligned with the canonical BeeChinese product docs in docs/ instead of inventing a conflicting product direction.
+            - {"For bounded scaffolding/docs/normalization tasks, prefer 1-2 steps and assume a single outer cycle should usually be enough." if self._run_profile().simple_task else "Use multiple steps only when the goal genuinely needs them."}
             """
         ).strip()
 
@@ -1073,6 +1507,7 @@ class BeeChineseOrchestrator:
             - Prefer terminal-first deterministic checks and inspect the smallest relevant set of files.
             - Use browser tools only when the task explicitly needs real page validation or local evidence is insufficient.
             - For simple scaffolding or docs-only tasks, aim to finish within a handful of targeted checks instead of broad exploration.
+            - {"This is a bounded scaffolding/docs/normalization task: at most one successful startup check per touched service, no repeated equivalent checks on alternate ports, and no repeated installs once the environment is already prepared." if self._run_profile().simple_task else "Avoid redundant checks once you already have enough evidence."}
             - If there are no material issues, return PASS with an empty issues list.
             - Confidence must be a number between 0 and 1.
             - Focus on whether this cycle's implementation is correct and whether it advances the stated goal safely.
@@ -1088,29 +1523,43 @@ class BeeChineseOrchestrator:
         cycle_history: str,
     ) -> CycleArtifact:
         LOGGER.info("Starting goal cycle=%s", cycle_number)
-        repo_summary = self._run_named_agent(
-            "repo-study",
-            self._build_repo_study_prompt(
-                goal=goal,
+        if self._run_profile().use_local_preflight:
+            plan = _local_plan_for_simple_task(
+                task=goal,
                 success_criteria=success_criteria,
-                cycle_number=cycle_number,
-                cycle_history=cycle_history,
-            ),
-        )
-        LOGGER.info("Completed repo-study cycle=%s", cycle_number)
-        plan = PlanArtifact.from_response(
-            self._run_named_agent(
-                "planner",
-                self._build_planner_prompt(
+                workspace=self.workspace,
+            )
+            repo_summary = plan.raw_response
+            LOGGER.info(
+                "Using local compact preflight cycle=%s owner_count=%s check_count=%s",
+                cycle_number,
+                len(plan.steps),
+                len(plan.checks),
+            )
+        else:
+            repo_summary = self._run_named_agent(
+                "repo-study",
+                self._build_repo_study_prompt(
                     goal=goal,
                     success_criteria=success_criteria,
                     cycle_number=cycle_number,
-                    repo_summary=repo_summary,
                     cycle_history=cycle_history,
                 ),
-            ),
-            user_task=goal,
-        )
+            )
+            LOGGER.info("Completed repo-study cycle=%s", cycle_number)
+            plan = PlanArtifact.from_response(
+                self._run_named_agent(
+                    "planner",
+                    self._build_planner_prompt(
+                        goal=goal,
+                        success_criteria=success_criteria,
+                        cycle_number=cycle_number,
+                        repo_summary=repo_summary,
+                        cycle_history=cycle_history,
+                    ),
+                ),
+                user_task=goal,
+            )
         LOGGER.info(
             "Planner result cycle=%s goal_complete=%s step_count=%s summary=%s",
             cycle_number,
@@ -1136,7 +1585,7 @@ class BeeChineseOrchestrator:
         verifier_results: list[VerifierArtifact] = []
         verifier_feedback: VerifierArtifact | None = None
 
-        for round_number in range(self.max_fix_rounds + 1):
+        for round_number in range(self._run_profile().effective_max_fix_rounds + 1):
             LOGGER.info(
                 "Entering cycle=%s implementation_round=%s",
                 cycle_number,
@@ -1203,15 +1652,28 @@ class BeeChineseOrchestrator:
         status: str,
         cycles: list[CycleArtifact],
     ) -> list[str]:
+        hygiene_hints: list[str] = []
+        if not (self.workspace / "AGENTS.md").exists():
+            hygiene_hints.append(
+                "Add a concise workspace-root AGENTS.md so future OpenHands runs retain BeeChinese product-repo memory across cycles."
+            )
+        if not (self.workspace / ".gitignore").exists():
+            hygiene_hints.append(
+                "Add a workspace .gitignore before more runs so node_modules, .venv, dist, and local IDE artifacts do not pollute git status."
+            )
+
         if not cycles:
-            return ["Run the orchestrator with a concrete task and success criteria."]
+            return hygiene_hints + [
+                "Run the orchestrator with a concrete task and success criteria."
+            ]
 
         last_cycle = cycles[-1]
         last_verifier = last_cycle.final_verifier
 
         if status == "PASS":
             return _dedupe(
-                [
+                hygiene_hints
+                + [
                     "Use this agent layer as the control plane before introducing real BeeChinese product apps under dedicated app/service directories.",
                     "Add the first concrete BeeChinese feature task, such as email auth, course catalog modeling, or a NestJS/FastAPI service skeleton.",
                     "Keep README, .openhands guidance, and agent definitions aligned as the repo evolves.",
@@ -1220,7 +1682,8 @@ class BeeChineseOrchestrator:
 
         if status == "PARTIAL":
             return _dedupe(
-                last_cycle.plan.remaining_work
+                hygiene_hints
+                + last_cycle.plan.remaining_work
                 + [
                     f"Increase --max-goal-cycles above {self.max_goal_cycles} if you want the orchestrator to keep advancing this goal automatically.",
                     "Narrow the task or add more specific success criteria if the planner keeps finding additional slices.",
@@ -1235,7 +1698,8 @@ class BeeChineseOrchestrator:
                 if issue.repair_suggestion.strip()
             )
         return _dedupe(
-            issue_hints
+            hygiene_hints
+            + issue_hints
             + last_cycle.plan.remaining_work
             + [
                 "Re-run the orchestrator after resolving the failing verifier issues.",
@@ -1249,10 +1713,27 @@ class BeeChineseOrchestrator:
         *,
         success_criteria: str = DEFAULT_SUCCESS_CRITERIA,
     ) -> RunReport:
+        run_profile = build_run_profile(
+            task=task,
+            success_criteria=success_criteria,
+            requested_max_fix_rounds=self.max_fix_rounds,
+            requested_max_goal_cycles=self.max_goal_cycles,
+        )
+        self._active_run_profile = run_profile
         LOGGER.info(
             "Starting BeeChinese run task=%s success_criteria=%s",
             task,
             success_criteria,
+        )
+        LOGGER.info(
+            "Run profile=%s simple_task=%s local_preflight=%s disable_browser_tools=%s effective_max_goal_cycles=%s effective_max_fix_rounds=%s orchestrator_max_iterations=%s",
+            run_profile.name,
+            run_profile.simple_task,
+            run_profile.use_local_preflight,
+            run_profile.disable_browser_tools,
+            run_profile.effective_max_goal_cycles,
+            run_profile.effective_max_fix_rounds,
+            run_profile.orchestrator_max_iterations,
         )
         before_paths = _git_changed_paths(self.workspace)
         cycles: list[CycleArtifact] = []
@@ -1260,150 +1741,173 @@ class BeeChineseOrchestrator:
         goal_complete = False
         goal_reason = ""
 
-        for cycle_number in range(1, self.max_goal_cycles + 1):
-            cycle = self._run_goal_cycle(
-                goal=task,
-                success_criteria=success_criteria,
-                cycle_number=cycle_number,
-                cycle_history=self._render_cycle_history(cycles),
-            )
-            cycles.append(cycle)
+        try:
+            for cycle_number in range(1, run_profile.effective_max_goal_cycles + 1):
+                cycle = self._run_goal_cycle(
+                    goal=task,
+                    success_criteria=success_criteria,
+                    cycle_number=cycle_number,
+                    cycle_history=self._render_cycle_history(cycles),
+                )
+                cycles.append(cycle)
 
-            if cycle.plan.goal_complete:
-                status = "PASS"
-                goal_complete = True
+                if cycle.plan.goal_complete:
+                    status = "PASS"
+                    goal_complete = True
+                    goal_reason = cycle.plan.goal_completion_reason or (
+                        f"The planner marked the goal complete at cycle {cycle_number}."
+                    )
+                    LOGGER.info("Run completed by planner at cycle=%s", cycle_number)
+                    break
+
+                final_verifier = cycle.final_verifier
+                if final_verifier is None:
+                    status = "FAIL"
+                    goal_reason = (
+                        f"Cycle {cycle_number} ended before a verifier result was captured."
+                    )
+                    LOGGER.error(
+                        "Run failed because no verifier result was captured in cycle=%s",
+                        cycle_number,
+                    )
+                    break
+
+                if not final_verifier.passed:
+                    status = "FAIL"
+                    goal_reason = (
+                        f"Cycle {cycle_number} failed verification after "
+                        f"{len(cycle.verifier_results)} implementation round(s)."
+                    )
+                    LOGGER.error(
+                        "Run failed verification at cycle=%s rounds=%s issues=%s",
+                        cycle_number,
+                        len(cycle.verifier_results),
+                        len(final_verifier.issues),
+                    )
+                    break
+
+                if run_profile.single_cycle_completion:
+                    status = "PASS"
+                    goal_complete = True
+                    goal_reason = (
+                        final_verifier.summary
+                        or "A bounded task profile treats the first clean verifier PASS as goal completion."
+                    )
+                    LOGGER.info(
+                        "Run completed by verifier PASS in compact profile at cycle=%s",
+                        cycle_number,
+                    )
+                    break
+
                 goal_reason = cycle.plan.goal_completion_reason or (
-                    f"The planner marked the goal complete at cycle {cycle_number}."
+                    f"Cycle {cycle_number} passed verification, but the planner still sees remaining work."
                 )
-                LOGGER.info("Run completed by planner at cycle=%s", cycle_number)
-                break
-
-            final_verifier = cycle.final_verifier
-            if final_verifier is None:
-                status = "FAIL"
-                goal_reason = (
-                    f"Cycle {cycle_number} ended before a verifier result was captured."
-                )
-                LOGGER.error("Run failed because no verifier result was captured in cycle=%s", cycle_number)
-                break
-
-            if not final_verifier.passed:
-                status = "FAIL"
-                goal_reason = (
-                    f"Cycle {cycle_number} failed verification after "
-                    f"{len(cycle.verifier_results)} implementation round(s)."
-                )
-                LOGGER.error(
-                    "Run failed verification at cycle=%s rounds=%s issues=%s",
+                LOGGER.info(
+                    "Cycle=%s passed verification but goal remains incomplete",
                     cycle_number,
-                    len(cycle.verifier_results),
-                    len(final_verifier.issues),
-                )
-                break
-
-            goal_reason = cycle.plan.goal_completion_reason or (
-                f"Cycle {cycle_number} passed verification, but the planner still sees remaining work."
-            )
-            LOGGER.info(
-                "Cycle=%s passed verification but goal remains incomplete",
-                cycle_number,
-            )
-        else:
-            if cycles and cycles[-1].final_verifier and cycles[-1].final_verifier.passed:
-                status = "PARTIAL"
-                goal_reason = (
-                    f"Reached the safety limit of {self.max_goal_cycles} goal cycles "
-                    "before the planner marked the goal complete."
-                )
-                LOGGER.warning(
-                    "Run reached goal-cycle safety limit=%s with partial completion",
-                    self.max_goal_cycles,
                 )
             else:
-                status = "FAIL"
-                goal_reason = (
-                    f"Reached the safety limit of {self.max_goal_cycles} goal cycles "
-                    "without a clean completion."
-                )
-                LOGGER.error(
-                    "Run reached goal-cycle safety limit=%s without clean completion",
-                    self.max_goal_cycles,
-                )
+                if cycles and cycles[-1].final_verifier and cycles[-1].final_verifier.passed:
+                    status = "PARTIAL"
+                    goal_reason = (
+                        f"Reached the safety limit of {run_profile.effective_max_goal_cycles} goal cycles "
+                        "before the planner marked the goal complete."
+                    )
+                    LOGGER.warning(
+                        "Run reached goal-cycle safety limit=%s with partial completion",
+                        run_profile.effective_max_goal_cycles,
+                    )
+                else:
+                    status = "FAIL"
+                    goal_reason = (
+                        f"Reached the safety limit of {run_profile.effective_max_goal_cycles} goal cycles "
+                        "without a clean completion."
+                    )
+                    LOGGER.error(
+                        "Run reached goal-cycle safety limit=%s without clean completion",
+                        run_profile.effective_max_goal_cycles,
+                    )
 
-        after_paths = _git_changed_paths(self.workspace)
-        changed_files = sorted(after_paths - before_paths)
-
-        checks_run = _dedupe(
-            [
-                check
-                for cycle in cycles
-                for check in (
-                    cycle.plan.checks
-                    + (cycle.final_verifier.checks_run if cycle.final_verifier else [])
-                )
-            ]
-        )
-        last_cycle = cycles[-1] if cycles else None
-        if status == "PASS":
-            unresolved_risks = _dedupe(
-                (
-                    last_cycle.plan.risks
-                    if last_cycle is not None
-                    else []
-                )
-                + (
-                    last_cycle.final_verifier.unresolved_risks
-                    if last_cycle is not None and last_cycle.final_verifier is not None
-                    else []
-                )
+            after_paths = _git_changed_paths(self.workspace)
+            changed_files, omitted_runtime_artifacts = _split_changed_paths_for_report(
+                after_paths - before_paths
             )
-        else:
-            unresolved_risks = _dedupe(
-                (
-                    last_cycle.plan.risks + last_cycle.plan.remaining_work
-                    if last_cycle is not None
-                    else []
-                )
-                + (
-                    last_cycle.final_verifier.unresolved_risks
-                    if last_cycle is not None and last_cycle.final_verifier is not None
-                    else []
-                )
-                + (
-                    [
-                        f"{issue.severity}: {issue.title}"
-                        for issue in last_cycle.final_verifier.issues
-                    ]
-                    if last_cycle is not None and last_cycle.final_verifier is not None
-                    else []
-                )
+
+            checks_run = _dedupe(
+                [
+                    check
+                    for cycle in cycles
+                    for check in (
+                        cycle.plan.checks
+                        + (cycle.final_verifier.checks_run if cycle.final_verifier else [])
+                    )
+                ]
             )
-        modified_summary = "\n\n".join(
-            cycle.render_summary() for cycle in cycles if cycle.render_summary().strip()
-        )
+            last_cycle = cycles[-1] if cycles else None
+            if status == "PASS":
+                unresolved_risks = _dedupe(
+                    (
+                        last_cycle.plan.risks
+                        if last_cycle is not None
+                        else []
+                    )
+                    + (
+                        last_cycle.final_verifier.unresolved_risks
+                        if last_cycle is not None and last_cycle.final_verifier is not None
+                        else []
+                    )
+                )
+            else:
+                unresolved_risks = _dedupe(
+                    (
+                        last_cycle.plan.risks + last_cycle.plan.remaining_work
+                        if last_cycle is not None
+                        else []
+                    )
+                    + (
+                        last_cycle.final_verifier.unresolved_risks
+                        if last_cycle is not None and last_cycle.final_verifier is not None
+                        else []
+                    )
+                    + (
+                        [
+                            f"{issue.severity}: {issue.title}"
+                            for issue in last_cycle.final_verifier.issues
+                        ]
+                        if last_cycle is not None and last_cycle.final_verifier is not None
+                        else []
+                    )
+                )
+            modified_summary = "\n\n".join(
+                cycle.render_summary() for cycle in cycles if cycle.render_summary().strip()
+            )
 
-        LOGGER.info(
-            "Finished BeeChinese run status=%s cycles_run=%s changed_files=%s checks=%s unresolved_risks=%s",
-            status,
-            len(cycles),
-            len(changed_files),
-            len(checks_run),
-            len(unresolved_risks),
-        )
+            LOGGER.info(
+                "Finished BeeChinese run status=%s cycles_run=%s changed_files=%s omitted_runtime_artifacts=%s checks=%s unresolved_risks=%s",
+                status,
+                len(cycles),
+                len(changed_files),
+                len(omitted_runtime_artifacts),
+                len(checks_run),
+                len(unresolved_risks),
+            )
 
-        return RunReport(
-            task=task,
-            success_criteria=success_criteria,
-            status=status,
-            cycles_run=len(cycles),
-            goal_complete=goal_complete,
-            goal_reason=goal_reason,
-            modified_summary=modified_summary,
-            changed_files=changed_files,
-            checks_run=checks_run,
-            unresolved_risks=unresolved_risks,
-            next_steps=self._build_next_steps(status=status, cycles=cycles),
-        )
+            return RunReport(
+                task=task,
+                success_criteria=success_criteria,
+                status=status,
+                cycles_run=len(cycles),
+                goal_complete=goal_complete,
+                goal_reason=goal_reason,
+                modified_summary=modified_summary,
+                changed_files=changed_files,
+                omitted_runtime_artifacts=omitted_runtime_artifacts,
+                checks_run=checks_run,
+                unresolved_risks=unresolved_risks,
+                next_steps=self._build_next_steps(status=status, cycles=cycles),
+            )
+        finally:
+            self._active_run_profile = None
 
 
 def validate_workspace(control_root: Path) -> str:
@@ -1532,6 +2036,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Disable browser access for the parent orchestrator agent.",
     )
+    run_parser.add_argument(
+        "--show-events",
+        choices=("off", "summary", "full"),
+        default=os.environ.get("BEECHINESE_AGENT_SHOW_EVENTS", "summary"),
+        help=EVENT_STREAM_HELP,
+    )
 
     validate_parser = subparsers.add_parser(
         "validate",
@@ -1577,6 +2087,7 @@ def main(argv: list[str] | None = None) -> int:
             max_fix_rounds=args.max_fix_rounds,
             max_goal_cycles=args.max_goal_cycles,
             enable_browser=not args.no_browser,
+            event_stream=args.show_events,
         )
         report = orchestrator.run(
             task=args.task,

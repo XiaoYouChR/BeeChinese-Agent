@@ -34,6 +34,7 @@ Your job is to convert repo context and user intent into a small, concrete imple
 - Prefer `sdk-platform` for Python/OpenHands/bootstrap tasks.
 - Do not invent product scope that conflicts with the canonical BeeChinese product docs.
 - Prefer one meaningful product loop per cycle instead of broad multi-loop plans.
+- For bounded scaffolding, normalization, or docs tasks, prefer 1-2 steps and assume one clean cycle should usually be enough.
 
 ## Quality bar
 
