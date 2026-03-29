@@ -1,0 +1,2 @@
+# Core runtime for the BeeChinese OpenHands autonomous coding layer.
+openhands-sdk==1.15.0
