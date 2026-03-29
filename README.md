@@ -45,6 +45,10 @@ The future engineering target assumed by this repo is:
 │   ├── docs_tool.py             # Preferred docs lookup toolset
 │   └── orchestrator.py          # Parent orchestration + verifier loop
 ├── docs/
+│   ├── beechinese-agent-playbook.md # Task-splitting and owner guidance for agent runs
+│   ├── beechinese-acceptance.md # Cross-cutting product acceptance cues
+│   ├── beechinese-feature-map.md # MVP/phase roadmap for product capabilities
+│   ├── beechinese-product-brief.md # Canonical BeeChinese product scope
 │   └── example-tasks.md         # Suggested prompts for future runs
 ├── tools/
 │   └── run_beechinese_agent.py  # Main CLI entry point
@@ -65,6 +69,17 @@ The repo ships with these specialist agents:
 - `fastapi-ai`: future AI-service work.
 - `verifier`: strict non-implementing validation agent.
 - `docs-writer`: README / docs / interface note updates.
+
+## Canonical Product Context
+
+The detailed BeeChinese product context is intentionally centralized instead of duplicated across every agent prompt.
+
+- `docs/beechinese-product-brief.md`: the canonical product brief and module-level expectations.
+- `docs/beechinese-feature-map.md`: MVP vs later-phase slicing for planning decisions.
+- `docs/beechinese-acceptance.md`: cross-cutting acceptance cues for planning, implementation, and verification.
+- `docs/beechinese-agent-playbook.md`: task-splitting heuristics, owner mapping, and common failure modes for agent runs.
+
+`.openhands/AGENTS.md` remains the shorter repository entry point, but when product intent matters these docs should be treated as the default source of truth.
 
 ## Workflow
 
@@ -156,7 +171,7 @@ This scaffold is intentionally close to current OpenHands SDK patterns:
 - The parent orchestrator uses `TaskToolSet` for delegation.
 - Documentation lookup now prefers a custom `docs_tool_set` backed by preferred official docs sources and cached sitemap discovery.
 - For docs sites with weak sitemap support, the docs tool can fall back to official source metadata such as the NestJS docs repository tree before using browser fallback.
-- Repo guidance is loaded as skills/context, with explicit support for `.openhands/AGENTS.md`.
+- Repo guidance, canonical BeeChinese product docs, and the agent playbook are loaded as skills/context for the agent runtime.
 - The verifier loop is implemented at the Python orchestration layer for determinism.
 - An outer goal loop keeps repeating full cycles until the goal is complete or a safe stop condition is reached.
 

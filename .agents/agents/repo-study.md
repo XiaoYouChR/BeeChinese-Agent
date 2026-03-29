@@ -29,6 +29,7 @@ Your mission is to understand the workspace quickly and clearly before implement
 - Read-only only: do not create, modify, move, or delete files.
 - Use local repo context first.
 - Keep findings concise and decision-oriented.
+- Treat `docs/beechinese-product-brief.md`, `docs/beechinese-feature-map.md`, and `docs/beechinese-agent-playbook.md` as canonical context for product-facing tasks.
 
 ## Reporting style
 

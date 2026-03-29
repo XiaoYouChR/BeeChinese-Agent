@@ -49,6 +49,7 @@ from openhands.tools.terminal import TerminalTool
 
 from beechinese_agent.config import (
     AGENTS_DIR,
+    CANONICAL_CONTEXT_PATHS,
     DEFAULT_EXAMPLE_TASK,
     DEFAULT_MAX_FIX_ROUNDS,
     DEFAULT_MAX_GOAL_CYCLES,
@@ -79,6 +80,7 @@ ORCHESTRATOR_SYSTEM_PROMPT = textwrap.dedent(
     - Do not make direct code edits yourself in this role.
     - Delegate coding to specialist agents named in the plan.
     - Do not ask the verifier agent to implement fixes.
+    - Treat the canonical BeeChinese product docs in docs/ as the source of truth for product scope, priorities, and acceptance expectations.
     - Prefer official documentation domains first, but do not treat them as a hard ban on all other sources.
     - Keep summaries concise and actionable.
     """
@@ -179,11 +181,13 @@ def _coerce_float(value: Any, default: float = 0.0) -> float:
 
 
 def load_repo_skills(workspace: Path) -> list[Skill]:
-    """Load project skills plus the canonical .openhands repo guidance file."""
+    """Load project skills plus canonical BeeChinese repo/product guidance docs."""
     skills = load_project_skills(workspace)
-    canonical_guidance = workspace / REPO_GUIDANCE_PATH
-    if canonical_guidance.exists():
-        canonical_skill = Skill.load(canonical_guidance)
+    for relative_path in CANONICAL_CONTEXT_PATHS:
+        source = workspace / relative_path
+        if not source.exists():
+            continue
+        canonical_skill = Skill.load(source)
         if not any(skill.source == canonical_skill.source for skill in skills):
             skills.append(canonical_skill)
     return skills
@@ -750,6 +754,7 @@ class BeeChineseOrchestrator:
 
             Rules:
             - Read local files first.
+            - Treat the canonical BeeChinese product docs in docs/ as the default source of truth for product-facing scope and priorities.
             - Do not modify files.
             - Mention if the repo is mostly blank or scaffold-only.
             - Account for prior cycle progress and do not ignore already completed work.
@@ -817,6 +822,7 @@ class BeeChineseOrchestrator:
             - Do not assign verifier as an implementation owner.
             - Include the most useful validation commands in "checks".
             - Reflect the long-term BeeChinese stack: Taro + Next.js + NestJS + FastAPI + PostgreSQL + Redis + MinIO.
+            - Keep the plan aligned with the canonical BeeChinese product docs in docs/ instead of inventing a conflicting product direction.
             """
         ).strip()
 
@@ -873,6 +879,7 @@ class BeeChineseOrchestrator:
             Verification rules:
             - Be strict and specific.
             - FAIL if required files are missing, scripts are broken, or docs contradict behavior.
+            - Check the canonical BeeChinese product docs in docs/ when product intent or acceptance expectations are relevant.
             - If there are no material issues, return PASS with an empty issues list.
             - Confidence must be a number between 0 and 1.
             - Focus on whether this cycle's implementation is correct and whether it advances the stated goal safely.
@@ -1140,6 +1147,10 @@ def validate_workspace(workspace: Path) -> str:
     registry.validate_required_agents()
     skills = load_repo_skills(workspace)
     guidance_path = workspace / REPO_GUIDANCE_PATH
+    product_context_paths = [path for path in CANONICAL_CONTEXT_PATHS if path != REPO_GUIDANCE_PATH]
+    canonical_docs_present = sum(
+        1 for relative_path in product_context_paths if (workspace / relative_path).exists()
+    )
 
     lines = [
         "BeeChinese agent workspace validation passed.",
@@ -1147,6 +1158,8 @@ def validate_workspace(workspace: Path) -> str:
         f"Agents loaded: {', '.join(sorted(registry.definitions))}",
         f"Project skills loaded: {len(skills)}",
         f"Canonical guidance present: {'yes' if guidance_path.exists() else 'no'}",
+        "Canonical product-context docs present: "
+        f"{canonical_docs_present}/{len(product_context_paths)}",
         "Registered tool names available in code: "
         f"{TerminalTool.name}, {ApplyPatchTool.name}, {TaskTrackerTool.name}, "
         f"{TaskToolSet.name}, {BrowserToolSet.name}, {DocsToolSet.name}",

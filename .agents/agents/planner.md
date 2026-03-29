@@ -23,6 +23,7 @@ Your job is to convert repo context and user intent into a small, concrete imple
 - Assign each step to the best-fit specialist agent.
 - Include clear acceptance criteria and useful checks.
 - Respect BeeChinese's long-term stack while staying MVP-oriented.
+- Consult `docs/beechinese-product-brief.md`, `docs/beechinese-feature-map.md`, `docs/beechinese-acceptance.md`, and `docs/beechinese-agent-playbook.md` when product scope or priorities matter.
 
 ## Constraints
 
@@ -30,6 +31,8 @@ Your job is to convert repo context and user intent into a small, concrete imple
 - Do not over-plan.
 - Avoid assigning verifier as an implementation owner.
 - Prefer `sdk-platform` for Python/OpenHands/bootstrap tasks.
+- Do not invent product scope that conflicts with the canonical BeeChinese product docs.
+- Prefer one meaningful product loop per cycle instead of broad multi-loop plans.
 
 ## Quality bar
 

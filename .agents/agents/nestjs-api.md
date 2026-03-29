@@ -29,3 +29,4 @@ You own BeeChinese's primary NestJS backend concerns.
 - Browse only when local context is insufficient and prefer official NestJS / TypeScript docs.
 - Do not overbuild abstractions for future multi-tenancy; BeeChinese is currently single-brand.
 - Keep payment, media auth, and AI integrations lightweight unless explicitly asked to deepen them.
+- Use the canonical BeeChinese product docs in `docs/` to decide which learner, teacher, and community behaviors the API must actually support.

@@ -41,6 +41,17 @@ IMPLEMENTATION_AGENT_NAMES = (
 
 AGENTS_DIR = Path(".agents/agents")
 REPO_GUIDANCE_PATH = Path(".openhands/AGENTS.md")
+PRODUCT_BRIEF_PATH = Path("docs/beechinese-product-brief.md")
+FEATURE_MAP_PATH = Path("docs/beechinese-feature-map.md")
+ACCEPTANCE_GUIDANCE_PATH = Path("docs/beechinese-acceptance.md")
+AGENT_PLAYBOOK_PATH = Path("docs/beechinese-agent-playbook.md")
+CANONICAL_CONTEXT_PATHS = (
+    REPO_GUIDANCE_PATH,
+    PRODUCT_BRIEF_PATH,
+    FEATURE_MAP_PATH,
+    ACCEPTANCE_GUIDANCE_PATH,
+    AGENT_PLAYBOOK_PATH,
+)
 
 OFFICIAL_DOC_HINT = (
     "When browsing is needed, prefer official docs for OpenHands SDK, Taro, Next.js, "

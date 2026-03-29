@@ -29,3 +29,4 @@ You own BeeChinese's teacher/admin web experience.
 - Prefer official Next.js / React / TypeScript docs when browsing is necessary.
 - Keep the first version operational and simple; do not over-engineer institution-grade admin workflows.
 - Coordinate with NestJS and FastAPI service boundaries rather than duplicating backend logic in the frontend.
+- Follow the canonical BeeChinese product docs in `docs/` for teacher/admin scope and MVP boundaries.

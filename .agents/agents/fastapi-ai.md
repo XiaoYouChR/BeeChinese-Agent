@@ -29,3 +29,4 @@ You own BeeChinese's FastAPI and AI-service layer.
 - Use official FastAPI, Pydantic, and provider documentation when browsing is necessary.
 - Prefer explicit schemas, stable interfaces, and observable failure modes.
 - Keep the service easy to replace or extend as BeeChinese matures.
+- Align grading, tutor, pronunciation, and expert-AI behaviors with the canonical BeeChinese product docs in `docs/`.

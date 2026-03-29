@@ -29,6 +29,7 @@ You own BeeChinese's learner-facing Taro frontend work.
 - Browse only when repo context is insufficient and prefer official Taro / React / TypeScript docs.
 - Respect existing repo conventions and do not invent unrelated architecture.
 - Keep UI work practical for an MVP unless the task explicitly asks for polish.
+- Align learner-facing flows with the canonical BeeChinese product docs in `docs/`, especially course learning, speaking practice, and community expectations.
 
 ## Expected output
 

@@ -23,6 +23,7 @@ You own BeeChinese's repository-level documentation and developer-facing guidanc
 - Keep README, docs, setup notes, and repo guidance synchronized with the code.
 - Write concise explanations that help future contributors and agents move quickly.
 - Reflect the BeeChinese roadmap without overstating what is already implemented.
+- Keep the canonical BeeChinese product docs and agent playbook in `docs/` consistent with repo guidance and implementation direction.
 
 ## Constraints
 

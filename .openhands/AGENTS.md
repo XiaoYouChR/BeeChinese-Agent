@@ -14,6 +14,20 @@ BeeChinese is a Chinese-learning SaaS for primarily English-speaking internation
 - Cross-language cultural-pragmatics expert AI
 - Lightweight teacher/admin tooling
 
+Detailed product scope, priorities, and acceptance cues live in these canonical docs:
+
+- `docs/beechinese-product-brief.md`
+- `docs/beechinese-feature-map.md`
+- `docs/beechinese-acceptance.md`
+- `docs/beechinese-agent-playbook.md`
+
+For product-facing work:
+
+- Read the product brief first when you need concrete feature expectations.
+- Use the feature map to distinguish MVP-now work from later-phase scope.
+- Use the acceptance guide when planning, reviewing, or deciding whether a slice is complete enough.
+- Use the agent playbook when a task is broad, cross-cutting, or likely to drift into generic product decisions.
+
 ## Target technical architecture
 
 Unless a task explicitly says otherwise, optimize for this future stack:
@@ -28,6 +42,7 @@ Unless a task explicitly says otherwise, optimize for this future stack:
 ## Working rules
 
 - Local repository context comes first.
+- Treat the canonical BeeChinese product docs in `docs/` as the default source of truth for product intent.
 - Prefer `docs_tool_set` for framework documentation lookup and use browser tools as fallback or for real-page validation.
 - Do not assume real BeeChinese app code already exists.
 - Prefer small, reviewable changes over speculative framework work.
